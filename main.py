@@ -32,6 +32,8 @@ class JiaranPostPlugin(Star):
         os.makedirs(self._data_dir, exist_ok=True)
         self._cache_path = os.path.join(self._data_dir, "posts_cache.json")
         self._cache_ts_path = os.path.join(self._data_dir, "cache_timestamp.json")
+        self._img_dir = os.path.join(self._data_dir, "images")
+        os.makedirs(self._img_dir, exist_ok=True)
         self._refresh_lock = asyncio.Lock()
         self._register_cron()
 
@@ -51,6 +53,8 @@ class JiaranPostPlugin(Star):
     # ==================== 指令 ====================
 
     @filter.command("抽动态")
+    SKIP_TYPES = {"MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_LIVE_RCMD"}
+
     async def cmd_draw_post(self, event: AstrMessageEvent):
         """随机抽取一条嘉然B站动态并让LLM评论"""
         items = await self._get_all_posts()
@@ -59,7 +63,13 @@ class JiaranPostPlugin(Star):
             yield event.plain_result("❌ 获取嘉然动态失败，请查看日志排查原因~")
             return
 
-        item = random.choice(items)
+        # 过滤掉视频投稿和直播动态
+        candidates = [i for i in items if self._get_post_type(i) not in self.SKIP_TYPES]
+        if not candidates:
+            yield event.plain_result("❌ 没有可用的日常动态~")
+            return
+
+        item = random.choice(candidates)
         text, pub_ts, post_id, img_urls = self._parse_post(item)
         if not post_id:
             yield event.plain_result("❌ 解析动态数据出错，请稍后重试~")
@@ -69,10 +79,16 @@ class JiaranPostPlugin(Star):
         bj_time = datetime.fromtimestamp(pub_ts, tz=timezone(timedelta(hours=8)))
         time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
 
+        # 发送图片（先下载再发送，可作为独立消息）
+        if img_urls:
+            downloaded = await self._download_images(img_urls)
+            for img_path in downloaded:
+                yield event.image_result(img_path)
+
         # 先获取 LLM 评论
         llm_comment = await self._get_llm_comment(text)
 
-        # 拼接单条消息
+        # 拼接正文
         parts = ["📢 抽到了一条然然的B站动态！\n"]
         if text.strip():
             parts.append(f"「{text.strip()}」")
@@ -309,7 +325,8 @@ class JiaranPostPlugin(Star):
                         card_obj = json.loads(card.get("card", "{}"))
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         continue
-                    new_items.append(self._build_item_from_legacy(desc, card_obj, pid))
+                    legacy_type = int(desc.get("type", 0))
+                    new_items.append(self._build_item_from_legacy(desc, card_obj, pid, legacy_type))
                 if hit_cached:
                     logger.info(f"[抽然动态] legacy 增量: 遇已缓存，+{len(new_items)}条")
                     return new_items
@@ -399,11 +416,12 @@ class JiaranPostPlugin(Star):
                 for card in cards:
                     desc = card.get("desc", {})
                     pid = str(desc.get("dynamic_id", ""))
+                    legacy_type = int(desc.get("type", 0))
                     try:
                         card_obj = json.loads(card.get("card", "{}"))
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         continue
-                    all_items.append(self._build_item_from_legacy(desc, card_obj, pid))
+                    all_items.append(self._build_item_from_legacy(desc, card_obj, pid, legacy_type))
                 logger.info(f"[抽然动态] legacy 第{page}页: {len(cards)} 条")
                 has_more = page_data.get("has_more", 0)
                 next_offset = desc.get("dynamic_id_str", "0") if cards else "0"
@@ -414,15 +432,23 @@ class JiaranPostPlugin(Star):
         logger.info(f"[抽然动态] legacy 共 {page} 页，{len(all_items)} 条")
         return all_items
 
-    def _build_item_from_legacy(self, desc: dict, card_obj: dict, pid: str) -> dict:
+    def _build_item_from_legacy(self, desc: dict, card_obj: dict, pid: str, legacy_type: int = 0) -> dict:
         """统一的旧版卡片 → 新版格式转换"""
         text, img_urls = self._extract_from_legacy_card(card_obj)
+        # 旧版 type → polymer major_type 映射
+        type_map = {
+            2: "MAJOR_TYPE_DRAW",
+            8: "MAJOR_TYPE_ARCHIVE",
+            64: "MAJOR_TYPE_ARTICLE",
+        }
+        major_type = type_map.get(legacy_type, "")
         return {
             "id_str": pid,
             "modules": {
                 "module_author": {"pub_ts": int(desc.get("timestamp", 0))},
                 "module_dynamic": {
                     "desc": {"text": text},
+                    "major": {"type": major_type} if major_type else {},
                     "_img_urls": img_urls,
                 },
             },
@@ -461,6 +487,16 @@ class JiaranPostPlugin(Star):
         return text or "", img_urls
 
     # ==================== 动态解析 ====================
+
+    @staticmethod
+    def _get_post_type(item: dict) -> str:
+        """获取动态类型（polymer major_type），用于过滤"""
+        if not isinstance(item, dict):
+            return ""
+        modules = item.get("modules") or {}
+        mod_post = modules.get("module_dynamic") or {}
+        major = mod_post.get("major") or {}
+        return major.get("type") or ""
 
     @staticmethod
     def _extract_text_from_summary(summary: dict) -> str:
@@ -599,6 +635,40 @@ class JiaranPostPlugin(Star):
                 text = "[分享了图文]"
 
         return text, pub_ts, post_id, img_urls
+
+    # ==================== 图片下载 ====================
+
+    async def _download_images(self, img_urls: list) -> list:
+        """下载图片到本地，返回本地路径列表"""
+        downloaded = []
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.bilibili.com/",
+        }
+        async with httpx.AsyncClient() as client:
+            for url in img_urls[:9]:
+                try:
+                    resp = await client.get(url, headers=headers, timeout=20)
+                    if resp.status_code == 200:
+                        ct = resp.headers.get("content-type", "")
+                        ext = ".jpg"
+                        if "png" in ct:
+                            ext = ".png"
+                        elif "gif" in ct:
+                            ext = ".gif"
+                        elif "webp" in ct:
+                            ext = ".webp"
+                        filepath = os.path.join(self._img_dir, f"{abs(hash(url))}{ext}")
+                        with open(filepath, "wb") as f:
+                            f.write(resp.content)
+                        downloaded.append(filepath)
+                except Exception as e:
+                    logger.warning(f"[抽然动态] 图片下载失败 {url[:60]}: {e}")
+        return downloaded
 
     # ==================== LLM 评论 ====================
 
