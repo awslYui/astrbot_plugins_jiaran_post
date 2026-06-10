@@ -514,7 +514,7 @@ class JiaranPostPlugin(Star):
         text = desc.get("text") or ""
 
         if not text.strip():
-            text = self._extract_text_from_summary(desc)
+            text = JiaranPostPlugin._extract_text_from_summary(desc)
 
         # 转发动态
         major = mod_post.get("major") or {}
@@ -550,7 +550,7 @@ class JiaranPostPlugin(Star):
         if major_type == "MAJOR_TYPE_OPUS":
             opus = major.get("opus") or {}
             # 从 opus.summary 提取文本（含 rich_text_nodes）
-            opus_text = self._extract_text_from_summary(opus.get("summary") or {})
+            opus_text = JiaranPostPlugin._extract_text_from_summary(opus.get("summary") or {})
             if opus_text:
                 text = opus_text
             # 从 opus 提取图片
