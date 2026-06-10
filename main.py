@@ -536,23 +536,25 @@ class JiaranPostPlugin(Star):
         post_id = item.get("id_str", "")
 
         # 动态内容模块
-        mod_post = modules.get("module_dynamic", {})
-        desc = mod_post.get("desc", {})
-        text = desc.get("text", "")
+        mod_post = modules.get("module_dynamic") or {}
+        desc = mod_post.get("desc") or {}
+        text = desc.get("text") or ""
 
         # 如果是转发动态，附加原动态文本
-        orig = mod_post.get("major", {}).get("orig")
+        major = mod_post.get("major") or {}
+        orig = major.get("orig")
         if orig:
-            orig_desc = orig.get("desc", {}).get("text", "")
-            orig_author = orig.get("module_author", {}).get("name", "")
+            orig_desc = (orig.get("desc") or {}).get("text") or ""
+            orig_author = (orig.get("module_author") or {}).get("name") or ""
             if orig_desc:
                 text = f"{text}\n//@{orig_author}：{orig_desc}"
 
         # 如果是纯图片动态但无文字
         if not text.strip():
-            major_type = mod_post.get("major", {}).get("type", "")
+            major_type = major.get("type") or ""
             if major_type == "MAJOR_TYPE_DRAW":
-                draw_items = mod_post.get("major", {}).get("draw", {}).get("items", [])
+                draw = major.get("draw") or {}
+                draw_items = draw.get("items", [])
                 text = f"[分享了{len(draw_items)}张图片]"
 
         return text, pub_ts, post_id
