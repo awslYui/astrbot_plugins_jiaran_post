@@ -1,0 +1,20 @@
+{
+  "llm_provider_id_override": {
+    "description": "LLM提供商ID覆写",
+    "type": "string",
+    "hint": "指定用于评论动态的LLM提供商ID，留空则使用当前会话默认的LLM提供商",
+    "default": ""
+  },
+  "cache_max_age_seconds": {
+    "description": "缓存有效期（秒）",
+    "type": "int",
+    "hint": "缓存超过此时间后自动全量刷新，默认21600（6小时）",
+    "default": 21600
+  },
+  "max_fetch_pages": {
+    "description": "最大拉取页数限制",
+    "type": "int",
+    "hint": "限制全量拉取时最多拉取多少页，0表示不限制",
+    "default": 0
+  }
+}
