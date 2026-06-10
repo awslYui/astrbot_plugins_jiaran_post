@@ -5,6 +5,12 @@
     "hint": "指定用于评论动态的LLM提供商ID，留空则使用当前会话默认的LLM提供商",
     "default": ""
   },
+  "bilibili_cookie": {
+    "description": "B站Cookie（SESSDATA）",
+    "type": "string",
+    "hint": "浏览器登录B站后，F12→Application→Cookies→复制SESSDATA字段的值。新版API需要登录态才能拉取动态",
+    "default": ""
+  },
   "cache_max_age_seconds": {
     "description": "缓存有效期（秒）",
     "type": "int",

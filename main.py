@@ -16,13 +16,16 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("jiaran_post", "plugin_dev", "抽然动态", "1.1.0")
+@register("jiaran_post", "plugin_dev", "抽然动态", "1.2.0")
 class JiaranPostPlugin(Star):
     """嘉然B站动态随机抽取插件"""
 
     # 嘉然B站 UID
     JIARAN_UID = "672328094"
-    SPACE_API = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
+    # 新版 API（需登录）
+    POLYMER_API = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
+    # 旧版 API（无需登录，作为降级方案）
+    LEGACY_API = "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history"
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -63,7 +66,7 @@ class JiaranPostPlugin(Star):
         # 1. 获取全量动态（优先缓存，缓存过期则刷新）
         items = await self._get_all_posts()
         if not items:
-            yield event.plain_result("❌ 获取嘉然动态失败，请稍后重试~")
+            yield event.plain_result("❌ 获取嘉然动态失败，请查看日志排查原因~")
             return
 
         # 2. 随机选取一条
@@ -164,13 +167,8 @@ class JiaranPostPlugin(Star):
 
     # ==================== B站API（分页拉全量） ====================
 
-    async def _fetch_all_posts(self) -> list:
-        """分页拉取嘉然全部历史动态"""
-        all_items = []
-        offset = ""
-        page = 0
-        max_pages = int(self._config.get("max_fetch_pages", 0))  # 0=不限制
-
+    def _build_headers(self) -> dict:
+        """构建请求头，包含可选的 Cookie"""
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -178,7 +176,29 @@ class JiaranPostPlugin(Star):
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
             "Referer": f"https://space.bilibili.com/{self.JIARAN_UID}/dynamic",
+            "Origin": "https://space.bilibili.com",
         }
+        cookie = self._config.get("bilibili_cookie", "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
+    async def _fetch_all_posts(self) -> list:
+        """分页拉取嘉然全部历史动态，优先新版API，失败降级旧版"""
+        items = await self._fetch_with_polymer()
+        if not items:
+            logger.warning("[抽然动态] 新版API拉取失败，尝试旧版API...")
+            items = await self._fetch_with_legacy()
+        return items
+
+    async def _fetch_with_polymer(self) -> list:
+        """使用新版 Polymer API 拉取（需登录态）"""
+        all_items = []
+        offset = ""
+        page = 0
+        max_pages = int(self._config.get("max_fetch_pages", 0))
+
+        headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
             while True:
@@ -193,18 +213,27 @@ class JiaranPostPlugin(Star):
 
                 try:
                     resp = await client.get(
-                        self.SPACE_API, params=params, headers=headers, timeout=15
+                        self.POLYMER_API, params=params, headers=headers, timeout=15
                     )
                     data = resp.json()
                 except httpx.TimeoutException:
-                    logger.error(f"[抽然动态] 第{page}页请求超时，停止")
+                    logger.error(f"[抽然动态] polymer 第{page}页请求超时")
                     break
                 except Exception as e:
-                    logger.error(f"[抽然动态] 第{page}页请求失败: {e}，停止")
+                    logger.error(f"[抽然动态] polymer 第{page}页请求失败: {e}")
                     break
 
-                if data.get("code") != 0:
-                    logger.error(f"[抽然动态] API返回异常: code={data.get('code')}, msg={data.get('message')}")
+                code = data.get("code")
+                if code != 0:
+                    logger.error(
+                        f"[抽然动态] polymer API返回异常: code={code}, "
+                        f"msg={data.get('message')}, HTTP状态={resp.status_code}"
+                    )
+                    if code == -101 or code == -111:
+                        logger.error(
+                            "[抽然动态] 需要登录B站账号！请在插件配置中填入 bilibili_cookie "
+                            "(浏览器登录B站后从F12→Application→Cookies中复制SESSDATA字段)"
+                        )
                     break
 
                 page_data = data.get("data", {})
@@ -214,16 +243,126 @@ class JiaranPostPlugin(Star):
                 has_more = page_data.get("has_more", False)
                 offset = page_data.get("offset", "")
 
-                logger.info(f"[抽然动态] 第{page}页: {len(items)} 条, has_more={has_more}")
+                logger.info(f"[抽然动态] polymer 第{page}页: {len(items)} 条, has_more={has_more}")
 
                 if not has_more:
                     break
 
-                # B站API限流保护
                 await asyncio.sleep(0.3)
 
-        logger.info(f"[抽然动态] 共拉取 {page} 页，总计 {len(all_items)} 条动态")
+        logger.info(f"[抽然动态] polymer 共 {page} 页，{len(all_items)} 条")
         return all_items
+
+    async def _fetch_with_legacy(self) -> list:
+        """使用旧版 API 拉取（无需登录，兜底方案）"""
+        all_items = []
+        offset_dynamic_id = "0"
+        page = 0
+        max_pages = int(self._config.get("max_fetch_pages", 0)) or 200
+
+        headers = self._build_headers()
+
+        async with httpx.AsyncClient() as client:
+            while True:
+                page += 1
+                if page > max_pages:
+                    break
+
+                params = {
+                    "host_uid": self.JIARAN_UID,
+                    "offset_dynamic_id": offset_dynamic_id,
+                    "need_top": "0",
+                    "platform": "web",
+                }
+
+                try:
+                    resp = await client.get(
+                        self.LEGACY_API, params=params, headers=headers, timeout=15
+                    )
+                    data = resp.json()
+                except httpx.TimeoutException:
+                    logger.error(f"[抽然动态] legacy 第{page}页请求超时")
+                    break
+                except Exception as e:
+                    logger.error(f"[抽然动态] legacy 第{page}页请求失败: {e}")
+                    break
+
+                code = data.get("code")
+                if code != 0:
+                    logger.error(
+                        f"[抽然动态] legacy API返回异常: code={code}, "
+                        f"msg={data.get('message')}, HTTP状态={resp.status_code}"
+                    )
+                    break
+
+                page_data = data.get("data", {})
+                cards = page_data.get("cards", [])
+                if not cards:
+                    break
+
+                # 旧版API卡片格式转换，兼容 _parse_post
+                for card in cards:
+                    desc = card.get("desc", {})
+                    card_obj = json.loads(card.get("card", "{}"))
+                    item = {
+                        "id_str": str(desc.get("dynamic_id", "")),
+                        "modules": {
+                            "module_author": {
+                                "pub_ts": desc.get("timestamp", 0),
+                            },
+                            "module_dynamic": {
+                                "desc": {
+                                    "text": self._extract_text_from_legacy_card(card_obj),
+                                },
+                            },
+                        },
+                    }
+                    all_items.append(item)
+
+                has_more = page_data.get("has_more", 0)
+                next_offset = desc.get("dynamic_id_str", "0") if cards else "0"
+                offset_dynamic_id = next_offset
+
+                logger.info(f"[抽然动态] legacy 第{page}页: {len(cards)} 条, has_more={has_more}")
+
+                if not has_more:
+                    break
+
+                await asyncio.sleep(0.3)
+
+        logger.info(f"[抽然动态] legacy 共 {page} 页，{len(all_items)} 条")
+        return all_items
+
+    @staticmethod
+    def _extract_text_from_legacy_card(card_obj: dict) -> str:
+        """从旧版API卡片中提取文本"""
+        item = card_obj.get("item", {})
+
+        # 纯文字动态
+        description = item.get("description", "")
+        if description:
+            return description
+
+        # 带图动态的描述
+        desc = card_obj.get("user", {}).get("desc", "")
+        if desc:
+            return desc
+
+        # 转发动态的原内容
+        origin = card_obj.get("origin", "")
+        if origin:
+            try:
+                origin_obj = json.loads(origin) if isinstance(origin, str) else origin
+                return origin_obj.get("item", {}).get("description", "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # 小视频/专栏等
+        title = item.get("title", "")
+        if title:
+            return title
+
+        return ""
 
     @staticmethod
     def _parse_post(item: dict) -> tuple:
