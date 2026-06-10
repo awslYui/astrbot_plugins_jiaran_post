@@ -7,8 +7,6 @@ import json
 import time
 import random
 import asyncio
-import re
-import tempfile
 
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -34,9 +32,6 @@ class JiaranPostPlugin(Star):
         os.makedirs(self._data_dir, exist_ok=True)
         self._cache_path = os.path.join(self._data_dir, "posts_cache.json")
         self._cache_ts_path = os.path.join(self._data_dir, "cache_timestamp.json")
-        self._img_dir = os.path.join(self._data_dir, "images")
-        os.makedirs(self._img_dir, exist_ok=True)
-
         self._refresh_lock = asyncio.Lock()
         self._register_cron()
 
@@ -74,30 +69,25 @@ class JiaranPostPlugin(Star):
         bj_time = datetime.fromtimestamp(pub_ts, tz=timezone(timedelta(hours=8)))
         time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 发送正文
-        result_parts = ["📢 抽到了一条然然的B站动态！\n"]
-        if text.strip():
-            result_parts.append(f"「{text.strip()}」")
-        else:
-            result_parts.append("（纯图片动态，没有文字哦~）")
-        yield event.plain_result("\n".join(result_parts))
-
-        # 发送图片
-        if img_urls:
-            downloaded = await self._download_images(img_urls)
-            for img_path in downloaded:
-                yield event.image_result(img_path)
-
-        # LLM 评论
+        # 先获取 LLM 评论
         llm_comment = await self._get_llm_comment(text)
-        if llm_comment:
-            yield event.plain_result(f"💬 {llm_comment}")
 
-        # 链接和时间
-        yield event.plain_result(
-            f"🔗 原动态链接：{link}\n"
+        # 拼接单条消息
+        parts = ["📢 抽到了一条然然的B站动态！\n"]
+        if text.strip():
+            parts.append(f"「{text.strip()}」")
+        else:
+            parts.append("（纯图片动态，没有文字哦~）")
+
+        if llm_comment:
+            parts.append(f"\n💬 {llm_comment}")
+
+        parts.append(
+            f"\n🔗 原动态链接：{link}\n"
             f"🕐 发布时间：{time_str}"
         )
+
+        yield event.plain_result("\n".join(parts))
 
     @filter.command("更新动态")
     async def cmd_update(self, event: AstrMessageEvent):
@@ -473,6 +463,33 @@ class JiaranPostPlugin(Star):
     # ==================== 动态解析 ====================
 
     @staticmethod
+    def _extract_text_from_summary(summary: dict) -> str:
+        """从 summary 对象（含 text + rich_text_nodes）提取完整文本"""
+        text = summary.get("text") or ""
+        if text:
+            return text
+        nodes = summary.get("rich_text_nodes", [])
+        parts = []
+        for node in nodes:
+            ntype = node.get("type", "")
+            if ntype == "RICH_TEXT_NODE_TYPE_TEXT":
+                parts.append(node.get("text", ""))
+            elif ntype == "RICH_TEXT_NODE_TYPE_EMOJI":
+                emoji = node.get("emoji") or {}
+                parts.append(emoji.get("text", "[表情]"))
+            elif ntype == "RICH_TEXT_NODE_TYPE_AT":
+                parts.append(f"@{node.get('text', node.get('rid', ''))}")
+            elif ntype == "RICH_TEXT_NODE_TYPE_WEB":
+                parts.append(f"[链接：{node.get('text', '')}]")
+            elif ntype == "RICH_TEXT_NODE_TYPE_BV":
+                parts.append(f"[BV视频]")
+            elif ntype == "RICH_TEXT_NODE_TYPE_TOPIC":
+                parts.append(f"#{node.get('text', '')}#")
+            else:
+                parts.append(node.get("text", ""))
+        return "".join(parts)
+
+    @staticmethod
     def _parse_post(item: dict) -> tuple:
         """
         解析单条动态 → (文本, 时间戳, 动态ID, 图片URL列表)
@@ -497,28 +514,7 @@ class JiaranPostPlugin(Star):
         text = desc.get("text") or ""
 
         if not text.strip():
-            # 尝试从 rich_text_nodes 提取文本和表情
-            nodes = desc.get("rich_text_nodes", [])
-            parts = []
-            for node in nodes:
-                ntype = node.get("type", "")
-                if ntype == "RICH_TEXT_NODE_TYPE_TEXT":
-                    parts.append(node.get("text", ""))
-                elif ntype == "RICH_TEXT_NODE_TYPE_EMOJI":
-                    emoji = node.get("emoji") or {}
-                    parts.append(emoji.get("text", "[表情]"))
-                elif ntype == "RICH_TEXT_NODE_TYPE_AT":
-                    rid = node.get("rid", "")
-                    parts.append(f"@{node.get('text', rid)}")
-                elif ntype == "RICH_TEXT_NODE_TYPE_LOTTERY":
-                    parts.append(node.get("text", "[抽奖]"))
-                elif ntype == "RICH_TEXT_NODE_TYPE_WEB":
-                    parts.append(f"[链接]")
-                elif ntype == "RICH_TEXT_NODE_TYPE_BV":
-                    parts.append(f"[视频]")
-                else:
-                    parts.append(node.get("text", ""))
-            text = "".join(parts)
+            text = self._extract_text_from_summary(desc)
 
         # 转发动态
         major = mod_post.get("major") or {}
@@ -548,20 +544,48 @@ class JiaranPostPlugin(Star):
             if orig_desc:
                 text = f"{text}\n//@{orig_author}：{orig_desc}"
 
-        # 图片（polymer 格式）
+        # 扩展动态类型的特殊文本（OPUS、ARTICLE 等）
         major_type = major.get("type") or ""
-        if major_type == "MAJOR_TYPE_DRAW":
+
+        if major_type == "MAJOR_TYPE_OPUS":
+            opus = major.get("opus") or {}
+            # 从 opus.summary 提取文本（含 rich_text_nodes）
+            opus_text = self._extract_text_from_summary(opus.get("summary") or {})
+            if opus_text:
+                text = opus_text
+            # 从 opus 提取图片
+            for pic in opus.get("pics", []):
+                src = pic.get("url", "")
+                if src:
+                    img_urls.append(src)
+            # title
+            title = opus.get("title") or ""
+            if title and title not in text:
+                text = f"{text}\n【{title}】" if text else f"【{title}】"
+
+        elif major_type == "MAJOR_TYPE_DRAW":
             draw = major.get("draw") or {}
             for draw_item in draw.get("items", []):
                 src = draw_item.get("src", "")
                 if src:
                     img_urls.append(src)
+
         elif major_type == "MAJOR_TYPE_ARCHIVE":
             archive = major.get("archive") or {}
             cover = archive.get("cover", "")
             if cover:
                 img_urls.append(cover)
 
+        elif major_type == "MAJOR_TYPE_ARTICLE":
+            article = major.get("article") or {}
+            article_text = article.get("title") or article.get("desc") or ""
+            if article_text:
+                text = article_text if not text.strip() else f"{text}\n【{article_text}】"
+            for pic in article.get("covers", []):
+                if pic:
+                    img_urls.append(pic)
+
+        # 最终兜底文案
         if not text.strip():
             if img_urls:
                 text = f"[分享了{len(img_urls)}张图片]"
@@ -575,41 +599,6 @@ class JiaranPostPlugin(Star):
                 text = "[分享了图文]"
 
         return text, pub_ts, post_id, img_urls
-
-    # ==================== 图片下载 ====================
-
-    async def _download_images(self, img_urls: list) -> list:
-        """下载图片到本地，返回本地路径列表"""
-        downloaded = []
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.bilibili.com/",
-        }
-
-        async with httpx.AsyncClient() as client:
-            for url in img_urls[:9]:  # 最多9张
-                try:
-                    resp = await client.get(url, headers=headers, timeout=20)
-                    if resp.status_code == 200:
-                        ext = ".jpg"
-                        if "png" in resp.headers.get("content-type", ""):
-                            ext = ".png"
-                        elif "gif" in resp.headers.get("content-type", ""):
-                            ext = ".gif"
-                        elif "webp" in resp.headers.get("content-type", ""):
-                            ext = ".webp"
-                        filepath = os.path.join(self._img_dir, f"{hash(url)}{ext}")
-                        with open(filepath, "wb") as f:
-                            f.write(resp.content)
-                        downloaded.append(filepath)
-                except Exception as e:
-                    logger.warning(f"[抽然动态] 图片下载失败 {url[:60]}: {e}")
-
-        return downloaded
 
     # ==================== LLM 评论 ====================
 
