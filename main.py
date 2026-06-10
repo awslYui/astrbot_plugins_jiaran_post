@@ -314,7 +314,7 @@ class JiaranPostPlugin(Star):
                         "id_str": pid,
                         "modules": {
                             "module_author": {
-                                "pub_ts": desc.get("timestamp", 0),
+                                "pub_ts": int(desc.get("timestamp", 0)),
                             },
                             "module_dynamic": {
                                 "desc": {
@@ -530,7 +530,7 @@ class JiaranPostPlugin(Star):
 
         # 作者模块 → 发布时间
         author = modules.get("module_author", {})
-        pub_ts = author.get("pub_ts", 0)
+        pub_ts = int(author.get("pub_ts", 0))
 
         # 动态 ID
         post_id = item.get("id_str", "")
