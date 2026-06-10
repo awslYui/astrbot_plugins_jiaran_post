@@ -23,6 +23,7 @@ class JiaranPostPlugin(Star):
     JIARAN_UID = "672328094"
     POLYMER_API = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
     LEGACY_API = "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history"
+    SKIP_TYPES = {"MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_LIVE_RCMD"}
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -53,7 +54,6 @@ class JiaranPostPlugin(Star):
     # ==================== 指令 ====================
 
     @filter.command("抽动态")
-    SKIP_TYPES = {"MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_LIVE_RCMD"}
 
     async def cmd_draw_post(self, event: AstrMessageEvent):
         """随机抽取一条嘉然B站动态并让LLM评论"""
