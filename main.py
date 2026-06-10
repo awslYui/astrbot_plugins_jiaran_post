@@ -7,6 +7,8 @@ import json
 import time
 import random
 import asyncio
+import re
+import tempfile
 
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -16,38 +18,32 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("jiaran_post", "plugin_dev", "抽然动态", "1.2.0")
+@register("jiaran_post", "plugin_dev", "抽然动态", "1.4.0")
 class JiaranPostPlugin(Star):
     """嘉然B站动态随机抽取插件"""
 
-    # 嘉然B站 UID
     JIARAN_UID = "672328094"
-    # 新版 API（需登录）
     POLYMER_API = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
-    # 旧版 API（无需登录，作为降级方案）
     LEGACY_API = "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history"
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self._config = config or {}
 
-        # 缓存目录与文件
         self._data_dir = os.path.join("data", "jiaran_post")
         os.makedirs(self._data_dir, exist_ok=True)
         self._cache_path = os.path.join(self._data_dir, "posts_cache.json")
         self._cache_ts_path = os.path.join(self._data_dir, "cache_timestamp.json")
+        self._img_dir = os.path.join(self._data_dir, "images")
+        os.makedirs(self._img_dir, exist_ok=True)
 
-        # 缓存刷新锁，防止并发刷新
         self._refresh_lock = asyncio.Lock()
-
-        # 注册定时刷新任务
         self._register_cron()
 
     # ==================== 定时任务 ====================
 
     def _register_cron(self):
-        """根据配置注册定时刷新缓存"""
-        interval = int(self._config.get("cache_refresh_seconds", 21600))  # 默认6小时
+        interval = int(self._config.get("cache_refresh_seconds", 21600))
         cron_expr = f"0 */{max(1, interval // 3600)} * * *"
         try:
             self.context.register_task(cron_expr, self._auto_refresh)
@@ -55,7 +51,6 @@ class JiaranPostPlugin(Star):
             pass
 
     async def _auto_refresh(self):
-        """定时刷新缓存"""
         await self._refresh_cache()
 
     # ==================== 指令 ====================
@@ -63,50 +58,97 @@ class JiaranPostPlugin(Star):
     @filter.command("抽动态")
     async def cmd_draw_post(self, event: AstrMessageEvent):
         """随机抽取一条嘉然B站动态并让LLM评论"""
-        # 1. 获取全量动态（优先缓存，缓存过期则刷新）
         items = await self._get_all_posts()
-        # 过滤掉可能的空条目
         items = [i for i in items if i is not None]
         if not items:
             yield event.plain_result("❌ 获取嘉然动态失败，请查看日志排查原因~")
             return
 
-        # 2. 随机选取一条
         item = random.choice(items)
-
-        # 3. 解析动态内容
-        text, pub_ts, post_id = self._parse_post(item)
+        text, pub_ts, post_id, img_urls = self._parse_post(item)
         if not post_id:
             yield event.plain_result("❌ 解析动态数据出错，请稍后重试~")
             return
 
-        # 4. 构建原动态链接与时间
         link = f"https://t.bilibili.com/{post_id}"
         bj_time = datetime.fromtimestamp(pub_ts, tz=timezone(timedelta(hours=8)))
         time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 5. 调用LLM以BOT人设评价
-        llm_comment = await self._get_llm_comment(text)
-
-        # 6. 拼接最终消息
+        # 发送正文
         result_parts = ["📢 抽到了一条然然的B站动态！\n"]
         if text.strip():
-            result_parts.append(f"「{text.strip()}」\n")
+            result_parts.append(f"「{text.strip()}」")
         else:
-            result_parts.append("（动态中包含图片/表情，暂无文字描述）\n")
-
-        if llm_comment:
-            result_parts.append(f"\n💬 {llm_comment}\n")
-
-        result_parts.append(f"\n🔗 原动态链接：{link}")
-        result_parts.append(f"🕐 发布时间：{time_str}")
-
+            result_parts.append("（纯图片动态，没有文字哦~）")
         yield event.plain_result("\n".join(result_parts))
+
+        # 发送图片
+        if img_urls:
+            downloaded = await self._download_images(img_urls)
+            for img_path in downloaded:
+                yield event.image_result(img_path)
+
+        # LLM 评论
+        llm_comment = await self._get_llm_comment(text)
+        if llm_comment:
+            yield event.plain_result(f"💬 {llm_comment}")
+
+        # 链接和时间
+        yield event.plain_result(
+            f"🔗 原动态链接：{link}\n"
+            f"🕐 发布时间：{time_str}"
+        )
+
+    @filter.command("更新动态")
+    async def cmd_update(self, event: AstrMessageEvent):
+        """手动增量更新缓存（全员可用）"""
+        yield event.plain_result("🔄 正在检查嘉然最新动态...")
+        cache = self._load_cache()
+        if not cache:
+            yield event.plain_result("📡 无本地缓存，正在首次全量拉取，请稍候...")
+            items = await self._force_refresh()
+            if items:
+                yield event.plain_result(f"✅ 首次拉取完成，共 {len(items)} 条动态")
+            else:
+                yield event.plain_result("❌ 拉取失败")
+            return
+
+        existing_ids = {item.get("id_str", "") for item in cache}
+        new_items = await self._fetch_new_posts(existing_ids)
+        if new_items:
+            merged = new_items + cache
+            self._save_cache(merged)
+            yield event.plain_result(f"✅ 更新完成，新增 {len(new_items)} 条动态（总计 {len(merged)} 条）")
+        else:
+            self._save_cache(cache)  # 刷新时间戳
+            yield event.plain_result("✅ 已是最新，没有新动态~")
+
+    @filter.command("强制刷新动态")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_force_refresh(self, event: AstrMessageEvent):
+        """强制全量重新拉取（仅管理员）"""
+        yield event.plain_result("� 正在全量重新拉取嘉然历史动态，这可能需要一些时间...")
+        items = await self._force_refresh()
+        if items:
+            yield event.plain_result(f"✅ 全量刷新完成，共 {len(items)} 条动态")
+        else:
+            yield event.plain_result("❌ 全量拉取失败，请查看日志")
+
+    async def _force_refresh(self) -> list:
+        """强制全量拉取并覆盖缓存"""
+        async with self._refresh_lock:
+            if os.path.exists(self._cache_path):
+                os.remove(self._cache_path)
+            if os.path.exists(self._cache_ts_path):
+                os.remove(self._cache_ts_path)
+            items = await self._fetch_all_posts()
+            if items:
+                self._save_cache(items)
+            return items
 
     # ==================== 缓存管理 ====================
 
     def _load_cache(self) -> list | None:
-        """从本地加载缓存的动态列表"""
         if not os.path.exists(self._cache_path):
             return None
         try:
@@ -120,71 +162,61 @@ class JiaranPostPlugin(Star):
             return None
 
     def _save_cache(self, items: list):
-        """将动态列表保存到本地缓存"""
         with open(self._cache_path, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
         with open(self._cache_ts_path, "w", encoding="utf-8") as f:
             json.dump({"updated_at": time.time()}, f)
 
     def _is_cache_expired(self) -> bool:
-        """检查缓存是否过期"""
         if not os.path.exists(self._cache_ts_path):
             return True
         try:
             with open(self._cache_ts_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             elapsed = time.time() - data.get("updated_at", 0)
-            max_age = int(self._config.get("cache_max_age_seconds", 21600))  # 默认6小时
+            max_age = int(self._config.get("cache_max_age_seconds", 21600))
             return elapsed > max_age
         except Exception:
             return True
 
     async def _get_all_posts(self) -> list:
-        """获取全量动态，优先使用缓存"""
         cache = self._load_cache()
         if cache and not self._is_cache_expired():
             logger.info(f"[抽然动态] 使用缓存，共 {len(cache)} 条动态")
             return cache
-
-        # 缓存过期或不存在，刷新
         return await self._refresh_cache()
 
     async def _refresh_cache(self) -> list:
-        """刷新缓存：有旧缓存时增量拉取，无缓存时全量拉取"""
+        """有旧缓存 → 增量，无缓存 → 全量"""
         async with self._refresh_lock:
             cache = self._load_cache()
             if cache and not self._is_cache_expired():
                 return cache
 
             if cache:
-                # 有旧缓存 → 增量刷新
-                logger.info(f"[抽然动态] 缓存已过期（{len(cache)}条），开始增量拉取最新动态...")
+                logger.info(f"[抽然动态] 增量拉取（缓存 {len(cache)} 条）...")
                 existing_ids = {item.get("id_str", "") for item in cache}
                 new_items = await self._fetch_new_posts(existing_ids)
                 if new_items:
-                    # 新动态插到列表最前面
                     merged = new_items + cache
                     self._save_cache(merged)
-                    logger.info(f"[抽然动态] 增量刷新完成: 新增 {len(new_items)} 条，总计 {len(merged)} 条")
+                    logger.info(f"[抽然动态] 增量完成: +{len(new_items)}，共 {len(merged)} 条")
                     return merged
                 else:
-                    # 拉不到新的，刷新时间戳继续用旧缓存
                     self._save_cache(cache)
-                    logger.info("[抽然动态] 无新动态，继续使用旧缓存")
+                    logger.info("[抽然动态] 无新动态")
                     return cache
             else:
-                # 无缓存 → 首次全量拉取
-                logger.info("[抽然动态] 首次全量拉取嘉然历史动态...")
+                logger.info("[抽然动态] 首次全量拉取...")
                 items = await self._fetch_all_posts()
                 if items:
                     self._save_cache(items)
-                    logger.info(f"[抽然动态] 首次全量拉取完成，共 {len(items)} 条动态")
+                    logger.info(f"[抽然动态] 全量完成: {len(items)} 条")
                 return items
 
-    # ==================== B站API（分页拉全量） ====================
+    # ==================== B站API ====================
 
     def _build_headers(self) -> dict:
-        """构建请求头，包含可选的 Cookie"""
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -200,27 +232,23 @@ class JiaranPostPlugin(Star):
         return headers
 
     async def _fetch_all_posts(self) -> list:
-        """分页拉取嘉然全部历史动态，优先新版API，失败降级旧版"""
         items = await self._fetch_with_polymer()
         if not items:
-            logger.warning("[抽然动态] 新版API拉取失败，尝试旧版API...")
+            logger.warning("[抽然动态] polymer 失败，降级 legacy...")
             items = await self._fetch_with_legacy()
         return items
 
     async def _fetch_new_posts(self, existing_ids: set) -> list:
-        """增量拉取：只拉最新页面，遇到已缓存的帖子就停"""
         new_items = await self._fetch_incremental_polymer(existing_ids)
         if new_items is None:
-            logger.warning("[抽然动态] 新版API增量拉取失败，尝试旧版API...")
+            logger.warning("[抽然动态] polymer 增量失败，降级 legacy...")
             new_items = await self._fetch_incremental_legacy(existing_ids)
         return new_items or []
 
     async def _fetch_incremental_polymer(self, existing_ids: set) -> list | None:
-        """新版API增量拉取，遇已缓存帖子停止"""
         new_items = []
         offset = ""
         page = 0
-
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
@@ -229,46 +257,33 @@ class JiaranPostPlugin(Star):
                 params = {"host_mid": self.JIARAN_UID, "features": "itemOpusStyle"}
                 if offset:
                     params["offset"] = offset
-
                 try:
-                    resp = await client.get(
-                        self.POLYMER_API, params=params, headers=headers, timeout=15
-                    )
+                    resp = await client.get(self.POLYMER_API, params=params, headers=headers, timeout=15)
                     data = resp.json()
                 except Exception as e:
-                    logger.error(f"[抽然动态] polymer 增量第{page}页失败: {e}")
+                    logger.error(f"[抽然动态] polymer 增量第{page}页: {e}")
                     return None if page == 1 else new_items
-
                 if data.get("code") != 0:
-                    logger.error(f"[抽然动态] polymer 增量API异常: code={data.get('code')}")
                     return None if page == 1 else new_items
-
                 page_data = data.get("data", {})
                 items = page_data.get("items", [])
-
                 for item in items:
                     pid = item.get("id_str", "")
                     if pid in existing_ids:
-                        logger.info(f"[抽然动态] polymer 增量: 第{page}页遇到已缓存帖子，停止（新增{len(new_items)}条）")
+                        logger.info(f"[抽然动态] polymer 增量: 遇已缓存，+{len(new_items)}条")
                         return new_items
                     new_items.append(item)
-
                 has_more = page_data.get("has_more", False)
                 offset = page_data.get("offset", "")
-
                 if not has_more:
                     break
-
                 await asyncio.sleep(0.3)
-
         return new_items
 
     async def _fetch_incremental_legacy(self, existing_ids: set) -> list | None:
-        """旧版API增量拉取，遇已缓存帖子停止"""
         new_items = []
         offset_dynamic_id = "0"
         page = 0
-
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
@@ -280,16 +295,12 @@ class JiaranPostPlugin(Star):
                     "need_top": "0",
                     "platform": "web",
                 }
-
                 try:
-                    resp = await client.get(
-                        self.LEGACY_API, params=params, headers=headers, timeout=15
-                    )
+                    resp = await client.get(self.LEGACY_API, params=params, headers=headers, timeout=15)
                     data = resp.json()
                 except Exception as e:
-                    logger.error(f"[抽然动态] legacy 增量第{page}页失败: {e}")
+                    logger.error(f"[抽然动态] legacy 增量第{page}页: {e}")
                     return None if page == 1 else new_items
-
                 if data.get("code") != 0:
                     return None if page == 1 else new_items
 
@@ -297,7 +308,6 @@ class JiaranPostPlugin(Star):
                 cards = page_data.get("cards", [])
                 if not cards:
                     break
-
                 hit_cached = False
                 for card in cards:
                     desc = card.get("desc", {})
@@ -308,107 +318,65 @@ class JiaranPostPlugin(Star):
                     try:
                         card_obj = json.loads(card.get("card", "{}"))
                     except (json.JSONDecodeError, TypeError, AttributeError):
-                        logger.warning(f"[抽然动态] legacy 增量卡片解析失败，跳过")
                         continue
-                    item = {
-                        "id_str": pid,
-                        "modules": {
-                            "module_author": {
-                                "pub_ts": int(desc.get("timestamp", 0)),
-                            },
-                            "module_dynamic": {
-                                "desc": {
-                                    "text": self._extract_text_from_legacy_card(card_obj),
-                                },
-                            },
-                        },
-                    }
-                    new_items.append(item)
-
+                    new_items.append(self._build_item_from_legacy(desc, card_obj, pid))
                 if hit_cached:
-                    logger.info(f"[抽然动态] legacy 增量: 第{page}页遇到已缓存帖子，停止（新增{len(new_items)}条）")
+                    logger.info(f"[抽然动态] legacy 增量: 遇已缓存，+{len(new_items)}条")
                     return new_items
-
                 has_more = page_data.get("has_more", 0)
                 next_offset = desc.get("dynamic_id_str", "0") if cards else "0"
                 offset_dynamic_id = next_offset
-
                 if not has_more:
                     break
-
                 await asyncio.sleep(0.3)
-
         return new_items
 
     async def _fetch_with_polymer(self) -> list:
-        """使用新版 Polymer API 拉取（需登录态）"""
         all_items = []
         offset = ""
         page = 0
         max_pages = int(self._config.get("max_fetch_pages", 0))
-
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
             while True:
                 page += 1
                 if max_pages > 0 and page > max_pages:
-                    logger.info(f"[抽然动态] 达到最大分页限制 {max_pages}，停止拉取")
                     break
-
                 params = {"host_mid": self.JIARAN_UID, "features": "itemOpusStyle"}
                 if offset:
                     params["offset"] = offset
-
                 try:
-                    resp = await client.get(
-                        self.POLYMER_API, params=params, headers=headers, timeout=15
-                    )
+                    resp = await client.get(self.POLYMER_API, params=params, headers=headers, timeout=15)
                     data = resp.json()
                 except httpx.TimeoutException:
-                    logger.error(f"[抽然动态] polymer 第{page}页请求超时")
+                    logger.error(f"[抽然动态] polymer 第{page}页超时")
                     break
                 except Exception as e:
-                    logger.error(f"[抽然动态] polymer 第{page}页请求失败: {e}")
+                    logger.error(f"[抽然动态] polymer 第{page}页: {e}")
                     break
-
-                code = data.get("code")
-                if code != 0:
-                    logger.error(
-                        f"[抽然动态] polymer API返回异常: code={code}, "
-                        f"msg={data.get('message')}, HTTP状态={resp.status_code}"
-                    )
-                    if code == -101 or code == -111:
-                        logger.error(
-                            "[抽然动态] 需要登录B站账号！请在插件配置中填入 bilibili_cookie "
-                            "(浏览器登录B站后从F12→Application→Cookies中复制SESSDATA字段)"
-                        )
+                if data.get("code") != 0:
+                    logger.error(f"[抽然动态] polymer: code={data.get('code')}, msg={data.get('message')}")
+                    if data.get("code") in (-101, -111):
+                        logger.error("[抽然动态] 需要登录！请在配置中填入 bilibili_cookie")
                     break
-
                 page_data = data.get("data", {})
                 items = page_data.get("items", [])
                 all_items.extend(items)
-
+                logger.info(f"[抽然动态] polymer 第{page}页: {len(items)} 条")
                 has_more = page_data.get("has_more", False)
                 offset = page_data.get("offset", "")
-
-                logger.info(f"[抽然动态] polymer 第{page}页: {len(items)} 条, has_more={has_more}")
-
                 if not has_more:
                     break
-
                 await asyncio.sleep(0.3)
-
         logger.info(f"[抽然动态] polymer 共 {page} 页，{len(all_items)} 条")
         return all_items
 
     async def _fetch_with_legacy(self) -> list:
-        """使用旧版 API 拉取（无需登录，兜底方案）"""
         all_items = []
         offset_dynamic_id = "0"
         page = 0
         max_pages = int(self._config.get("max_fetch_pages", 0)) or 200
-
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
@@ -416,159 +384,248 @@ class JiaranPostPlugin(Star):
                 page += 1
                 if page > max_pages:
                     break
-
                 params = {
                     "host_uid": self.JIARAN_UID,
                     "offset_dynamic_id": offset_dynamic_id,
                     "need_top": "0",
                     "platform": "web",
                 }
-
                 try:
-                    resp = await client.get(
-                        self.LEGACY_API, params=params, headers=headers, timeout=15
-                    )
+                    resp = await client.get(self.LEGACY_API, params=params, headers=headers, timeout=15)
                     data = resp.json()
                 except httpx.TimeoutException:
-                    logger.error(f"[抽然动态] legacy 第{page}页请求超时")
+                    logger.error(f"[抽然动态] legacy 第{page}页超时")
                     break
                 except Exception as e:
-                    logger.error(f"[抽然动态] legacy 第{page}页请求失败: {e}")
+                    logger.error(f"[抽然动态] legacy 第{page}页: {e}")
                     break
-
-                code = data.get("code")
-                if code != 0:
-                    logger.error(
-                        f"[抽然动态] legacy API返回异常: code={code}, "
-                        f"msg={data.get('message')}, HTTP状态={resp.status_code}"
-                    )
+                if data.get("code") != 0:
+                    logger.error(f"[抽然动态] legacy: code={data.get('code')}, msg={data.get('message')}")
                     break
-
                 page_data = data.get("data", {})
                 cards = page_data.get("cards", [])
                 if not cards:
                     break
-
-                # 旧版API卡片格式转换，兼容 _parse_post
                 for card in cards:
                     desc = card.get("desc", {})
+                    pid = str(desc.get("dynamic_id", ""))
                     try:
                         card_obj = json.loads(card.get("card", "{}"))
                     except (json.JSONDecodeError, TypeError, AttributeError):
-                        logger.warning(f"[抽然动态] legacy 卡片解析失败，跳过")
                         continue
-                    item = {
-                        "id_str": str(desc.get("dynamic_id", "")),
-                        "modules": {
-                            "module_author": {
-                                "pub_ts": desc.get("timestamp", 0),
-                            },
-                            "module_dynamic": {
-                                "desc": {
-                                    "text": self._extract_text_from_legacy_card(card_obj),
-                                },
-                            },
-                        },
-                    }
-                    all_items.append(item)
-
+                    all_items.append(self._build_item_from_legacy(desc, card_obj, pid))
+                logger.info(f"[抽然动态] legacy 第{page}页: {len(cards)} 条")
                 has_more = page_data.get("has_more", 0)
                 next_offset = desc.get("dynamic_id_str", "0") if cards else "0"
                 offset_dynamic_id = next_offset
-
-                logger.info(f"[抽然动态] legacy 第{page}页: {len(cards)} 条, has_more={has_more}")
-
                 if not has_more:
                     break
-
                 await asyncio.sleep(0.3)
-
         logger.info(f"[抽然动态] legacy 共 {page} 页，{len(all_items)} 条")
         return all_items
 
+    def _build_item_from_legacy(self, desc: dict, card_obj: dict, pid: str) -> dict:
+        """统一的旧版卡片 → 新版格式转换"""
+        text, img_urls = self._extract_from_legacy_card(card_obj)
+        return {
+            "id_str": pid,
+            "modules": {
+                "module_author": {"pub_ts": int(desc.get("timestamp", 0))},
+                "module_dynamic": {
+                    "desc": {"text": text},
+                    "_img_urls": img_urls,
+                },
+            },
+        }
+
     @staticmethod
-    def _extract_text_from_legacy_card(card_obj: dict) -> str:
-        """从旧版API卡片中提取文本"""
-        item = card_obj.get("item", {})
+    def _extract_from_legacy_card(card_obj: dict) -> tuple:
+        """从旧版卡片提取 (文本, 图片URL列表)"""
+        item = card_obj.get("item") or {}
+        img_urls = []
 
-        # 纯文字动态
-        description = item.get("description", "")
-        if description:
-            return description
+        # 文本
+        text = (item.get("description") or
+                (card_obj.get("user") or {}).get("desc") or
+                item.get("content") or
+                item.get("title") or "")
 
-        # 带图动态的描述
-        desc = card_obj.get("user", {}).get("desc", "")
-        if desc:
-            return desc
-
-        # 转发动态的原内容
+        # 转发原内容
         origin = card_obj.get("origin", "")
-        if origin:
+        if origin and isinstance(origin, str):
             try:
-                origin_obj = json.loads(origin) if isinstance(origin, str) else origin
-                return origin_obj.get("item", {}).get("description", "")
+                origin_obj = json.loads(origin)
+                orig_text = (origin_obj.get("item", {}) or {}).get("description", "")
+                if orig_text:
+                    text = f"{text}\n//转发：{orig_text}" if text else f"//转发：{orig_text}"
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-        # 小视频/专栏等
-        title = item.get("title", "")
-        if title:
-            return title
+        # 图片
+        pictures = item.get("pictures", [])
+        for pic in pictures:
+            img_src = pic.get("img_src", "")
+            if img_src:
+                img_urls.append(img_src)
 
-        return ""
+        return text or "", img_urls
+
+    # ==================== 动态解析 ====================
 
     @staticmethod
     def _parse_post(item: dict) -> tuple:
         """
-        解析单条动态，返回 (文本内容, 发布时间戳, 动态ID)
-        处理纯文字、带图、转发等动态类型
+        解析单条动态 → (文本, 时间戳, 动态ID, 图片URL列表)
+        支持 polymer 和 legacy 两种格式
         """
         if not isinstance(item, dict):
-            return "", 0, ""
+            return "", 0, "", []
 
-        modules = item.get("modules", {})
+        modules = item.get("modules") or {}
 
-        # 作者模块 → 发布时间
-        author = modules.get("module_author", {})
+        author = modules.get("module_author") or {}
         pub_ts = int(author.get("pub_ts", 0))
-
-        # 动态 ID
         post_id = item.get("id_str", "")
 
-        # 动态内容模块
         mod_post = modules.get("module_dynamic") or {}
+
+        # 图片（legacy 格式直接存在 _img_urls 中）
+        img_urls = list(mod_post.get("_img_urls", []))
+
+        # 文本：优先 desc.text，其次 rich_text_nodes
         desc = mod_post.get("desc") or {}
         text = desc.get("text") or ""
 
-        # 如果是转发动态，附加原动态文本
+        if not text.strip():
+            # 尝试从 rich_text_nodes 提取文本和表情
+            nodes = desc.get("rich_text_nodes", [])
+            parts = []
+            for node in nodes:
+                ntype = node.get("type", "")
+                if ntype == "RICH_TEXT_NODE_TYPE_TEXT":
+                    parts.append(node.get("text", ""))
+                elif ntype == "RICH_TEXT_NODE_TYPE_EMOJI":
+                    emoji = node.get("emoji") or {}
+                    parts.append(emoji.get("text", "[表情]"))
+                elif ntype == "RICH_TEXT_NODE_TYPE_AT":
+                    rid = node.get("rid", "")
+                    parts.append(f"@{node.get('text', rid)}")
+                elif ntype == "RICH_TEXT_NODE_TYPE_LOTTERY":
+                    parts.append(node.get("text", "[抽奖]"))
+                elif ntype == "RICH_TEXT_NODE_TYPE_WEB":
+                    parts.append(f"[链接]")
+                elif ntype == "RICH_TEXT_NODE_TYPE_BV":
+                    parts.append(f"[视频]")
+                else:
+                    parts.append(node.get("text", ""))
+            text = "".join(parts)
+
+        # 转发动态
         major = mod_post.get("major") or {}
         orig = major.get("orig")
         if orig:
             orig_desc = (orig.get("desc") or {}).get("text") or ""
-            orig_author = (orig.get("module_author") or {}).get("name") or ""
+            orig_author = ((orig.get("modules") or {}).get("module_author") or {}).get("name") or ""
+            if not orig_desc:
+                # polymer 转发的原动态可能在 modules 里
+                orig_modules = orig.get("modules") or {}
+                orig_mod = orig_modules.get("module_dynamic") or {}
+                orig_desc = (orig_mod.get("desc") or {}).get("text") or ""
+                orig_author = (orig_modules.get("module_author") or {}).get("name") or orig_author
+                if not orig_desc:
+                    # rich_text_nodes
+                    orig_nodes = (orig_mod.get("desc") or {}).get("rich_text_nodes", [])
+                    orig_parts = []
+                    for node in orig_nodes:
+                        if node.get("type") == "RICH_TEXT_NODE_TYPE_TEXT":
+                            orig_parts.append(node.get("text", ""))
+                        elif node.get("type") == "RICH_TEXT_NODE_TYPE_EMOJI":
+                            emoji = node.get("emoji") or {}
+                            orig_parts.append(emoji.get("text", "[表情]"))
+                        else:
+                            orig_parts.append(node.get("text", ""))
+                    orig_desc = "".join(orig_parts)
             if orig_desc:
                 text = f"{text}\n//@{orig_author}：{orig_desc}"
 
-        # 如果是纯图片动态但无文字
-        if not text.strip():
-            major_type = major.get("type") or ""
-            if major_type == "MAJOR_TYPE_DRAW":
-                draw = major.get("draw") or {}
-                draw_items = draw.get("items", [])
-                text = f"[分享了{len(draw_items)}张图片]"
+        # 图片（polymer 格式）
+        major_type = major.get("type") or ""
+        if major_type == "MAJOR_TYPE_DRAW":
+            draw = major.get("draw") or {}
+            for draw_item in draw.get("items", []):
+                src = draw_item.get("src", "")
+                if src:
+                    img_urls.append(src)
+        elif major_type == "MAJOR_TYPE_ARCHIVE":
+            archive = major.get("archive") or {}
+            cover = archive.get("cover", "")
+            if cover:
+                img_urls.append(cover)
 
-        return text, pub_ts, post_id
+        if not text.strip():
+            if img_urls:
+                text = f"[分享了{len(img_urls)}张图片]"
+            elif major_type == "MAJOR_TYPE_ARTICLE":
+                text = "[分享了专栏文章]"
+            elif major_type == "MAJOR_TYPE_ARCHIVE":
+                text = f"[分享了视频：{(major.get('archive') or {}).get('title', '')}]"
+            elif major_type == "MAJOR_TYPE_LIVE_RCMD":
+                text = "[分享了直播间]"
+            elif major_type == "MAJOR_TYPE_OPUS":
+                text = "[分享了图文]"
+
+        return text, pub_ts, post_id, img_urls
+
+    # ==================== 图片下载 ====================
+
+    async def _download_images(self, img_urls: list) -> list:
+        """下载图片到本地，返回本地路径列表"""
+        downloaded = []
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.bilibili.com/",
+        }
+
+        async with httpx.AsyncClient() as client:
+            for url in img_urls[:9]:  # 最多9张
+                try:
+                    resp = await client.get(url, headers=headers, timeout=20)
+                    if resp.status_code == 200:
+                        ext = ".jpg"
+                        if "png" in resp.headers.get("content-type", ""):
+                            ext = ".png"
+                        elif "gif" in resp.headers.get("content-type", ""):
+                            ext = ".gif"
+                        elif "webp" in resp.headers.get("content-type", ""):
+                            ext = ".webp"
+                        filepath = os.path.join(self._img_dir, f"{hash(url)}{ext}")
+                        with open(filepath, "wb") as f:
+                            f.write(resp.content)
+                        downloaded.append(filepath)
+                except Exception as e:
+                    logger.warning(f"[抽然动态] 图片下载失败 {url[:60]}: {e}")
+
+        return downloaded
 
     # ==================== LLM 评论 ====================
 
     async def _get_llm_comment(self, post_text: str) -> str:
         """调用LLM以BOT人设评价动态"""
+        if post_text.strip():
+            content_desc = f"动态内容：\n{post_text.strip()}"
+        else:
+            content_desc = "这条动态是纯图片/视频动态，没有文字描述。"
+
         prompt = (
             f"下面是一条来自虚拟偶像「嘉然今天吃什么」在B站发布的最新动态。"
             f"请你以你的人物设定，从粉丝视角对这条动态发表一段简短的评论，"
             f"要求语气生动活泼、有真实粉丝的情感，不超过150字。"
             f"直接输出评论即可，不要加任何前缀。\n\n"
-            f"动态内容：\n{post_text if post_text.strip() else '（无文字内容，可能是纯图片动态）'}"
+            f"{content_desc}"
         )
 
         try:
