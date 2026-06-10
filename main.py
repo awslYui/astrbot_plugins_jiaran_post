@@ -65,6 +65,8 @@ class JiaranPostPlugin(Star):
         """随机抽取一条嘉然B站动态并让LLM评论"""
         # 1. 获取全量动态（优先缓存，缓存过期则刷新）
         items = await self._get_all_posts()
+        # 过滤掉可能的空条目
+        items = [i for i in items if i is not None]
         if not items:
             yield event.plain_result("❌ 获取嘉然动态失败，请查看日志排查原因~")
             return
@@ -109,7 +111,10 @@ class JiaranPostPlugin(Star):
             return None
         try:
             with open(self._cache_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, list):
+                return [i for i in data if i is not None]
+            return None
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"[抽然动态] 缓存文件损坏: {e}")
             return None
@@ -145,25 +150,36 @@ class JiaranPostPlugin(Star):
         return await self._refresh_cache()
 
     async def _refresh_cache(self) -> list:
-        """刷新缓存：全量拉取并写入本地"""
+        """刷新缓存：有旧缓存时增量拉取，无缓存时全量拉取"""
         async with self._refresh_lock:
-            # 双重检查：可能其他协程已刷新
             cache = self._load_cache()
             if cache and not self._is_cache_expired():
                 return cache
 
-            logger.info("[抽然动态] 开始全量拉取嘉然历史动态...")
-            items = await self._fetch_all_posts()
-            if items:
-                self._save_cache(items)
-                logger.info(f"[抽然动态] 缓存刷新完成，共 {len(items)} 条动态")
+            if cache:
+                # 有旧缓存 → 增量刷新
+                logger.info(f"[抽然动态] 缓存已过期（{len(cache)}条），开始增量拉取最新动态...")
+                existing_ids = {item.get("id_str", "") for item in cache}
+                new_items = await self._fetch_new_posts(existing_ids)
+                if new_items:
+                    # 新动态插到列表最前面
+                    merged = new_items + cache
+                    self._save_cache(merged)
+                    logger.info(f"[抽然动态] 增量刷新完成: 新增 {len(new_items)} 条，总计 {len(merged)} 条")
+                    return merged
+                else:
+                    # 拉不到新的，刷新时间戳继续用旧缓存
+                    self._save_cache(cache)
+                    logger.info("[抽然动态] 无新动态，继续使用旧缓存")
+                    return cache
             else:
-                # 拉取失败，用旧缓存兜底
-                stale = self._load_cache()
-                if stale:
-                    logger.warning("[抽然动态] 拉取失败，使用过期缓存")
-                    return stale
-            return items
+                # 无缓存 → 首次全量拉取
+                logger.info("[抽然动态] 首次全量拉取嘉然历史动态...")
+                items = await self._fetch_all_posts()
+                if items:
+                    self._save_cache(items)
+                    logger.info(f"[抽然动态] 首次全量拉取完成，共 {len(items)} 条动态")
+                return items
 
     # ==================== B站API（分页拉全量） ====================
 
@@ -190,6 +206,139 @@ class JiaranPostPlugin(Star):
             logger.warning("[抽然动态] 新版API拉取失败，尝试旧版API...")
             items = await self._fetch_with_legacy()
         return items
+
+    async def _fetch_new_posts(self, existing_ids: set) -> list:
+        """增量拉取：只拉最新页面，遇到已缓存的帖子就停"""
+        new_items = await self._fetch_incremental_polymer(existing_ids)
+        if new_items is None:
+            logger.warning("[抽然动态] 新版API增量拉取失败，尝试旧版API...")
+            new_items = await self._fetch_incremental_legacy(existing_ids)
+        return new_items or []
+
+    async def _fetch_incremental_polymer(self, existing_ids: set) -> list | None:
+        """新版API增量拉取，遇已缓存帖子停止"""
+        new_items = []
+        offset = ""
+        page = 0
+
+        headers = self._build_headers()
+
+        async with httpx.AsyncClient() as client:
+            while True:
+                page += 1
+                params = {"host_mid": self.JIARAN_UID, "features": "itemOpusStyle"}
+                if offset:
+                    params["offset"] = offset
+
+                try:
+                    resp = await client.get(
+                        self.POLYMER_API, params=params, headers=headers, timeout=15
+                    )
+                    data = resp.json()
+                except Exception as e:
+                    logger.error(f"[抽然动态] polymer 增量第{page}页失败: {e}")
+                    return None if page == 1 else new_items
+
+                if data.get("code") != 0:
+                    logger.error(f"[抽然动态] polymer 增量API异常: code={data.get('code')}")
+                    return None if page == 1 else new_items
+
+                page_data = data.get("data", {})
+                items = page_data.get("items", [])
+
+                for item in items:
+                    pid = item.get("id_str", "")
+                    if pid in existing_ids:
+                        logger.info(f"[抽然动态] polymer 增量: 第{page}页遇到已缓存帖子，停止（新增{len(new_items)}条）")
+                        return new_items
+                    new_items.append(item)
+
+                has_more = page_data.get("has_more", False)
+                offset = page_data.get("offset", "")
+
+                if not has_more:
+                    break
+
+                await asyncio.sleep(0.3)
+
+        return new_items
+
+    async def _fetch_incremental_legacy(self, existing_ids: set) -> list | None:
+        """旧版API增量拉取，遇已缓存帖子停止"""
+        new_items = []
+        offset_dynamic_id = "0"
+        page = 0
+
+        headers = self._build_headers()
+
+        async with httpx.AsyncClient() as client:
+            while True:
+                page += 1
+                params = {
+                    "host_uid": self.JIARAN_UID,
+                    "offset_dynamic_id": offset_dynamic_id,
+                    "need_top": "0",
+                    "platform": "web",
+                }
+
+                try:
+                    resp = await client.get(
+                        self.LEGACY_API, params=params, headers=headers, timeout=15
+                    )
+                    data = resp.json()
+                except Exception as e:
+                    logger.error(f"[抽然动态] legacy 增量第{page}页失败: {e}")
+                    return None if page == 1 else new_items
+
+                if data.get("code") != 0:
+                    return None if page == 1 else new_items
+
+                page_data = data.get("data", {})
+                cards = page_data.get("cards", [])
+                if not cards:
+                    break
+
+                hit_cached = False
+                for card in cards:
+                    desc = card.get("desc", {})
+                    pid = str(desc.get("dynamic_id", ""))
+                    if pid in existing_ids:
+                        hit_cached = True
+                        break
+                    try:
+                        card_obj = json.loads(card.get("card", "{}"))
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        logger.warning(f"[抽然动态] legacy 增量卡片解析失败，跳过")
+                        continue
+                    item = {
+                        "id_str": pid,
+                        "modules": {
+                            "module_author": {
+                                "pub_ts": desc.get("timestamp", 0),
+                            },
+                            "module_dynamic": {
+                                "desc": {
+                                    "text": self._extract_text_from_legacy_card(card_obj),
+                                },
+                            },
+                        },
+                    }
+                    new_items.append(item)
+
+                if hit_cached:
+                    logger.info(f"[抽然动态] legacy 增量: 第{page}页遇到已缓存帖子，停止（新增{len(new_items)}条）")
+                    return new_items
+
+                has_more = page_data.get("has_more", 0)
+                next_offset = desc.get("dynamic_id_str", "0") if cards else "0"
+                offset_dynamic_id = next_offset
+
+                if not has_more:
+                    break
+
+                await asyncio.sleep(0.3)
+
+        return new_items
 
     async def _fetch_with_polymer(self) -> list:
         """使用新版 Polymer API 拉取（需登录态）"""
@@ -303,7 +452,11 @@ class JiaranPostPlugin(Star):
                 # 旧版API卡片格式转换，兼容 _parse_post
                 for card in cards:
                     desc = card.get("desc", {})
-                    card_obj = json.loads(card.get("card", "{}"))
+                    try:
+                        card_obj = json.loads(card.get("card", "{}"))
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        logger.warning(f"[抽然动态] legacy 卡片解析失败，跳过")
+                        continue
                     item = {
                         "id_str": str(desc.get("dynamic_id", "")),
                         "modules": {
@@ -370,6 +523,9 @@ class JiaranPostPlugin(Star):
         解析单条动态，返回 (文本内容, 发布时间戳, 动态ID)
         处理纯文字、带图、转发等动态类型
         """
+        if not isinstance(item, dict):
+            return "", 0, ""
+
         modules = item.get("modules", {})
 
         # 作者模块 → 发布时间

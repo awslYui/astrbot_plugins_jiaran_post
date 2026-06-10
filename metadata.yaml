@@ -1,6 +1,6 @@
 name: jiaran_post
 description: 抽然动态 - 随机抽取嘉然全量B站历史动态，调用LLM以BOT人设评价，并附上原动态链接与发布时间。
-version: 1.2.0
+version: 1.3.1
 author: plugin_dev
 repo: ""
 display_name: 抽然动态
