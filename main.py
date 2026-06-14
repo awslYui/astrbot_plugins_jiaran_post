@@ -17,7 +17,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("jiaran_post", "plugin_dev", "抽然动态", "1.5.0")
+@register("jiaran_post", "plugin_dev", "抽然动态", "1.6.0")
 class JiaranPostPlugin(Star):
     """嘉然B站动态随机抽取插件"""
 
@@ -299,18 +299,51 @@ class JiaranPostPlugin(Star):
         return headers
 
     async def _fetch_all_posts(self) -> list:
-        items = await self._fetch_with_polymer()
-        if not items:
-            logger.warning("[抽然动态] polymer 失败，降级 legacy...")
-            items = await self._fetch_with_legacy()
-        return items
+        """并行拉取 polymer + legacy，合并去重，覆盖更全（尤其老图文）"""
+        results = await asyncio.gather(
+            self._fetch_with_polymer(),
+            self._fetch_with_legacy(),
+            return_exceptions=True,
+        )
+        polymer_items = results[0] if not isinstance(results[0], BaseException) else []
+        legacy_items = results[1] if not isinstance(results[1], BaseException) else []
+
+        # 以 id_str 去重（polymer 优先，legacy 补充 polymer 中没有的）
+        seen_ids = {item.get("id_str", "") for item in polymer_items if item.get("id_str")}
+        merged = list(polymer_items)
+        for item in legacy_items:
+            pid = item.get("id_str", "")
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                merged.append(item)
+
+        logger.info(
+            f"[抽然动态] polymer {len(polymer_items)} + legacy {len(legacy_items)}"
+            f" → 合并 {len(merged)} 条"
+        )
+        return merged
 
     async def _fetch_new_posts(self, existing_ids: set) -> list:
-        new_items = await self._fetch_incremental_polymer(existing_ids)
-        if new_items is None:
-            logger.warning("[抽然动态] polymer 增量失败，降级 legacy...")
-            new_items = await self._fetch_incremental_legacy(existing_ids)
-        return new_items or []
+        """并行增量拉取 polymer + legacy，合并去重"""
+        results = await asyncio.gather(
+            self._fetch_incremental_polymer(existing_ids),
+            self._fetch_incremental_legacy(existing_ids),
+            return_exceptions=True,
+        )
+        poly_new = results[0] if not isinstance(results[0], BaseException) else []
+        leg_new = results[1] if not isinstance(results[1], BaseException) else []
+
+        seen_ids = set(existing_ids)
+        merged = []
+        for item in (poly_new or []) + (leg_new or []):
+            pid = item.get("id_str", "")
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                merged.append(item)
+
+        if poly_new is not None and leg_new is not None:
+            logger.info(f"[抽然动态] 增量: polymer +{len(poly_new or [])} legacy +{len(leg_new or [])} → {len(merged)}")
+        return merged
 
     async def _fetch_incremental_polymer(self, existing_ids: set) -> list | None:
         new_items = []
