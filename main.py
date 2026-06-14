@@ -36,6 +36,7 @@ class JiaranPostPlugin(Star):
         self._cache_ts_path = os.path.join(self._data_dir, "cache_timestamp.json")
         self._img_dir = os.path.join(self._data_dir, "images")
         os.makedirs(self._img_dir, exist_ok=True)
+        self._fetch_state_path = os.path.join(self._data_dir, "fetch_state.json")
         self._refresh_lock = asyncio.Lock()
         self._register_cron()
 
@@ -386,6 +387,24 @@ class JiaranPostPlugin(Star):
 
     # ==================== B站API ====================
 
+    def _load_fetch_state(self) -> dict:
+        """加载断点续拉状态"""
+        if not os.path.exists(self._fetch_state_path):
+            return {}
+        try:
+            with open(self._fetch_state_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_fetch_state(self, state: dict):
+        """保存断点续拉状态"""
+        try:
+            with open(self._fetch_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"[抽然动态] 保存断点状态失败: {e}")
+
     def _build_headers(self) -> dict:
         headers = {
             "User-Agent": (
@@ -402,24 +421,78 @@ class JiaranPostPlugin(Star):
         return headers
 
     async def _fetch_all_posts(self) -> list:
-        items = await self._fetch_with_polymer()
-        if not items:
+        prev_state = self._load_fetch_state()
+        all_polymer = []
+        last_polymer_offset = ""
+
+        # 第一轮：polymer 正常拉取
+        polymer_items, last_polymer_offset = await self._fetch_with_polymer()
+        if not polymer_items:
             logger.warning("[抽然动态] polymer 空，降级纯 legacy...")
-            items = await self._fetch_with_legacy()
-        else:
-            # polymer 成功，再用 legacy 补拉更老的动态
-            logger.info(f"[抽然动态] polymer 拉完 {len(items)} 条，legacy 补拉旧动态...")
-            legacy_items = await self._fetch_with_legacy()
-            if legacy_items:
-                existing_ids = {i.get("id_str") for i in items}
-                new_count = 0
-                for li in legacy_items:
-                    if li.get("id_str") not in existing_ids:
-                        items.append(li)
-                        existing_ids.add(li["id_str"])
-                        new_count += 1
-                logger.info(f"[抽然动态] legacy 补拉 +{new_count} 条（合并后 {len(items)} 条）")
-        return items
+            legacy_items, last_legacy_did = await self._fetch_with_legacy()
+            # 保存 legacy 断点
+            if last_legacy_did:
+                self._save_fetch_state({
+                    "polymer_offset": last_polymer_offset,
+                    "legacy_dynamic_id": last_legacy_did,
+                })
+            return legacy_items
+
+        all_polymer = polymer_items
+        logger.info(f"[抽然动态] polymer 拉完 {len(polymer_items)} 条")
+
+        # 第二轮：从上轮断点续拉 polymer 旧数据
+        prev_polymer_offset = prev_state.get("polymer_offset", "")
+        if prev_polymer_offset:
+            logger.info(f"[抽然动态] polymer 续拉：从 {prev_polymer_offset} 继续...")
+            continuation, new_last_offset = await self._fetch_with_polymer(start_offset=prev_polymer_offset)
+            if continuation:
+                existing_ids = {i.get("id_str") for i in all_polymer}
+                new = 0
+                for item in continuation:
+                    if item.get("id_str") not in existing_ids:
+                        all_polymer.append(item)
+                        existing_ids.add(item["id_str"])
+                        new += 1
+                logger.info(f"[抽然动态] polymer 续拉 +{new} 条")
+                last_polymer_offset = new_last_offset
+
+        # 第三轮：legacy 补拉旧动态
+        logger.info("[抽然动态] legacy 补拉旧动态...")
+        legacy_items, last_legacy_did = await self._fetch_with_legacy()
+        if legacy_items:
+            existing_ids = {i.get("id_str") for i in all_polymer}
+            new_count = 0
+            for li in legacy_items:
+                if li.get("id_str") not in existing_ids:
+                    all_polymer.append(li)
+                    existing_ids.add(li["id_str"])
+                    new_count += 1
+            logger.info(f"[抽然动态] legacy 补拉 +{new_count} 条（合并后 {len(all_polymer)} 条）")
+
+        # 第四轮：从 legacy 断点续拉
+        prev_legacy_did = prev_state.get("legacy_dynamic_id", "")
+        if prev_legacy_did:
+            logger.info(f"[抽然动态] legacy 续拉：从 {prev_legacy_did} 继续...")
+            continuation, new_legacy_did = await self._fetch_with_legacy(start_dynamic_id=prev_legacy_did)
+            if continuation:
+                existing_ids = {i.get("id_str") for i in all_polymer}
+                new = 0
+                for item in continuation:
+                    if item.get("id_str") not in existing_ids:
+                        all_polymer.append(item)
+                        existing_ids.add(item["id_str"])
+                        new += 1
+                logger.info(f"[抽然动态] legacy 续拉 +{new} 条")
+                last_legacy_did = new_legacy_did
+
+        # 保存断点
+        self._save_fetch_state({
+            "polymer_offset": last_polymer_offset,
+            "legacy_dynamic_id": last_legacy_did,
+        })
+
+        return all_polymer
 
     async def _fetch_new_posts(self, existing_ids: set) -> list:
         new_items = await self._fetch_incremental_polymer(existing_ids)
@@ -460,7 +533,7 @@ class JiaranPostPlugin(Star):
                 offset = page_data.get("offset", "")
                 if not has_more:
                     break
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.8)
         return new_items
 
     async def _fetch_incremental_legacy(self, existing_ids: set) -> list | None:
@@ -512,13 +585,15 @@ class JiaranPostPlugin(Star):
                 offset_dynamic_id = next_offset
                 if not has_more:
                     break
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.8)
         return new_items
 
-    async def _fetch_with_polymer(self) -> list:
+    async def _fetch_with_polymer(self, start_offset: str = "") -> tuple:
+        """polymer 全量拉取 → (items, last_offset)"""
         all_items = []
-        offset = ""
+        offset = start_offset
         page = 0
+        last_good_offset = start_offset
         max_pages = int(self._config.get("max_fetch_pages", 0))
         headers = self._build_headers()
 
@@ -536,8 +611,8 @@ class JiaranPostPlugin(Star):
                 except httpx.TimeoutException:
                     logger.error(f"[抽然动态] polymer 第{page}页超时")
                     break
-                except Exception as e:
-                    logger.error(f"[抽然动态] polymer 第{page}页: {e}")
+                except Exception:
+                    logger.info(f"[抽然动态] polymer 第{page}页无数据，翻页终止")
                     break
                 if data.get("code") != 0:
                     logger.error(f"[抽然动态] polymer: code={data.get('code')}, msg={data.get('message')}")
@@ -550,19 +625,30 @@ class JiaranPostPlugin(Star):
                 logger.info(f"[抽然动态] polymer 第{page}页: {len(items)} 条")
                 has_more = page_data.get("has_more", False)
                 offset = page_data.get("offset", "")
+                if offset:
+                    last_good_offset = offset
                 if not has_more:
                     break
-                await asyncio.sleep(0.3)
-        logger.info(f"[抽然动态] polymer 共 {page} 页，{len(all_items)} 条")
-        return all_items
+                await asyncio.sleep(0.8)
+        label = "续拉" if start_offset else ""
+        logger.info(f"[抽然动态] polymer{label} 共 {page} 页，{len(all_items)} 条")
+        if all_items:
+            last = all_items[-1]
+            ts = JiaranPostPlugin._get_post_timestamp(last)
+            bj = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") if ts else "?"
+            txt = JiaranPostPlugin._extract_post_text_fast(last)[:60]
+            logger.info(f"[抽然动态] polymer{label} 最旧动态: [{bj}] {txt}")
+        return all_items, last_good_offset
 
-    async def _fetch_with_legacy(self) -> list:
+    async def _fetch_with_legacy(self, start_dynamic_id: str = "") -> tuple:
+        """legacy 全量拉取 → (items, last_dynamic_id)"""
         all_items = []
-        offset_dynamic_id = "0"
+        offset_dynamic_id = start_dynamic_id or "0"
         page = 0
+        last_good_id = offset_dynamic_id
         max_pages = int(self._config.get("max_fetch_pages", 0))
         if max_pages <= 0:
-            max_pages = 500  # 0 表示不限制，设一个安全上限
+            max_pages = 500
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
@@ -605,11 +691,20 @@ class JiaranPostPlugin(Star):
                 has_more = page_data.get("has_more", 0)
                 next_offset = desc.get("dynamic_id_str", "0") if cards else "0"
                 offset_dynamic_id = next_offset
+                if offset_dynamic_id and offset_dynamic_id != "0":
+                    last_good_id = offset_dynamic_id
                 if not has_more:
                     break
-                await asyncio.sleep(0.3)
-        logger.info(f"[抽然动态] legacy 共 {page} 页，{len(all_items)} 条")
-        return all_items
+                await asyncio.sleep(0.8)
+        label = "续拉" if start_dynamic_id else ""
+        logger.info(f"[抽然动态] legacy{label} 共 {page} 页，{len(all_items)} 条")
+        if all_items:
+            last = all_items[-1]
+            ts = JiaranPostPlugin._get_post_timestamp(last)
+            bj = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") if ts else "?"
+            txt = JiaranPostPlugin._extract_post_text_fast(last)[:60]
+            logger.info(f"[抽然动态] legacy{label} 最旧动态: [{bj}] {txt}")
+        return all_items, last_good_id
 
     def _build_item_from_legacy(self, desc: dict, card_obj: dict, pid: str, legacy_type: int = 0) -> dict:
         """统一的旧版卡片 → 新版格式转换"""
