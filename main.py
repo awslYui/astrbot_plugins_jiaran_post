@@ -132,18 +132,29 @@ class JiaranPostPlugin(Star):
     async def cmd_search_post(self, event: AstrMessageEvent):
         """按关键词或日期搜索嘉然动态并让LLM评论"""
         raw_text = event.message_str.strip()
-        # 提取参数（去掉指令前缀 "/搜动态"）
         param = re.sub(r'^[/\s]*搜动态\s*', '', raw_text).strip()
         if not param:
             yield event.plain_result(
                 "❌ 请输入关键词或日期，例如：\n"
                 "/搜动态 晚安\n"
-                "/搜动态 2024-07-24"
+                "/搜动态 2024-07-24\n"
+                "/搜动态 乐乐 3"
             )
             return
 
+        # 提取末尾序号
+        keyword = param
+        pick_index = 0  # 0=未指定，自动/列表
+        m_idx = re.search(r'\s+(\d+)$', param)
+        if m_idx:
+            pick_index = int(m_idx.group(1))
+            keyword = param[:m_idx.start()].strip()
+        if not keyword and not pick_index:
+            yield event.plain_result("❌ 请输入关键词或日期~")
+            return
+
         # 尝试日期解析
-        (date_tuple, date_err) = self._parse_date_input(param)
+        (date_tuple, date_err) = self._parse_date_input(keyword)
         if date_err:
             yield event.plain_result(date_err)
             return
@@ -169,35 +180,79 @@ class JiaranPostPlugin(Star):
                     matched.append(item)
 
             if not matched:
-                date_str = f"{y}年{mo}月{d}日"
-                yield event.plain_result(f"❌ 没有找到 {date_str} 的动态~")
+                yield event.plain_result(f"❌ 没有找到 {y}年{mo}月{d}日 的动态~")
                 return
 
-            item = random.choice(matched)
-            date_str = f"{y}年{mo}月{d}日"
-            async for result in self._render_one_post(
-                event, item,
-                f"📢 抽到一条 {date_str} 的然然动态！（当天共{len(matched)}条）\n"
-            ):
-                yield result
+            if pick_index:
+                if pick_index < 1 or pick_index > len(matched):
+                    yield event.plain_result(
+                        f"❌ 序号超出范围！当天共 {len(matched)} 条动态，请输入 1~{len(matched)}"
+                    )
+                    return
+                item = matched[pick_index - 1]
+                async for result in self._render_one_post(
+                    event, item,
+                    f"📢 选取了 {y}年{mo}月{d}日 第{pick_index}条动态！（当天共{len(matched)}条）\n"
+                ):
+                    yield result
+            elif len(matched) == 1:
+                item = matched[0]
+                async for result in self._render_one_post(
+                    event, item,
+                    f"📢 搜到一条 {y}年{mo}月{d}日 的然然动态！\n"
+                ):
+                    yield result
+            else:
+                yield event.plain_result(self._format_match_list(matched, f"{y}年{mo}月{d}日"))
         else:
             # --- 关键词搜索 ---
             matched = []
             for item in candidates:
                 post_text = self._extract_post_text_fast(item)
-                if param.lower() in post_text.lower():
+                if keyword.lower() in post_text.lower():
                     matched.append(item)
 
             if not matched:
-                yield event.plain_result(f"❌ 没有找到包含「{param}」的动态~")
+                yield event.plain_result(f"❌ 没有找到包含「{keyword}」的动态~")
                 return
 
-            item = random.choice(matched)
-            async for result in self._render_one_post(
-                event, item,
-                f"📢 搜到一条含「{param}」的然然动态！（共{len(matched)}条匹配）\n"
-            ):
-                yield result
+            if pick_index:
+                if pick_index < 1 or pick_index > len(matched):
+                    yield event.plain_result(
+                        f"❌ 序号超出范围！共 {len(matched)} 条匹配，请输入 1~{len(matched)}"
+                    )
+                    return
+                item = matched[pick_index - 1]
+                async for result in self._render_one_post(
+                    event, item,
+                    f"📢 选取了第{pick_index}条「{keyword}」动态！（共{len(matched)}条匹配）\n"
+                ):
+                    yield result
+            elif len(matched) == 1:
+                item = matched[0]
+                async for result in self._render_one_post(
+                    event, item,
+                    f"📢 搜到一条含「{keyword}」的然然动态！\n"
+                ):
+                    yield result
+            else:
+                yield event.plain_result(self._format_match_list(matched, f"「{keyword}」"))
+
+    @staticmethod
+    def _format_match_list(matched: list, label: str) -> str:
+        """格式化多条匹配结果列表"""
+        limit = min(len(matched), 15)
+        lines = [f"📢 关于 {label}，共找到 {len(matched)} 条动态：\n"]
+        for i, item in enumerate(matched[:limit], 1):
+            ts = JiaranPostPlugin._get_post_timestamp(item)
+            bj = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime("%m-%d %H:%M") if ts else "?"
+            txt = JiaranPostPlugin._extract_post_text_fast(item)
+            txt = txt[:40].replace('\n', ' ') + ("..." if len(txt) > 40 else "")
+            lines.append(f"({i}) [{bj}] {txt}")
+        if len(matched) > limit:
+            lines.append(f"... 还有 {len(matched) - limit} 条未列出")
+        lines.append(f"\n发送 /搜动态 {label} N 查看第N条")
+        return "\n".join(lines)
 
     async def _render_one_post(self, event: AstrMessageEvent, item: dict, header: str):
         """渲染并发送单条动态（正文+图片+LLM评论+链接+时间）"""
@@ -306,14 +361,14 @@ class JiaranPostPlugin(Star):
             yield event.plain_result("❌ 全量拉取失败，请查看日志")
 
     async def _force_refresh(self) -> list:
-        """强制全量拉取并覆盖缓存"""
+        """强制全量拉取并覆盖缓存（先拉后删，失败保留旧缓存）"""
         async with self._refresh_lock:
-            if os.path.exists(self._cache_path):
-                os.remove(self._cache_path)
-            if os.path.exists(self._cache_ts_path):
-                os.remove(self._cache_ts_path)
             items = await self._fetch_all_posts()
             if items:
+                if os.path.exists(self._cache_path):
+                    os.remove(self._cache_path)
+                if os.path.exists(self._cache_ts_path):
+                    os.remove(self._cache_ts_path)
                 self._save_cache(items)
             return items
 
@@ -598,6 +653,7 @@ class JiaranPostPlugin(Star):
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
+            rate_retries = 0
             while True:
                 page += 1
                 if max_pages > 0 and page > max_pages:
@@ -616,8 +672,15 @@ class JiaranPostPlugin(Star):
                     break
                 if data.get("code") != 0:
                     code = data.get("code")
+                    if code in (-352, -799) and rate_retries < 3:
+                        rate_retries += 1
+                        wait = 5 * rate_retries
+                        logger.warning(f"[抽然动态] polymer 被限流 (code={code})，{wait}s后重试 ({rate_retries}/3)...")
+                        await asyncio.sleep(wait)
+                        page -= 1  # 不消耗页号，重试同一页
+                        continue
                     if code in (-352, -799):
-                        logger.warning(f"[抽然动态] polymer 被限流 (code={code})，已保存断点，下次继续")
+                        logger.warning(f"[抽然动态] polymer 多次限流放弃，已保存断点")
                     elif code in (-101, -111):
                         logger.error("[抽然动态] 需要登录！请在配置中填入 bilibili_cookie")
                     else:
