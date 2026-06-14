@@ -52,6 +52,59 @@ class JiaranPostPlugin(Star):
     async def _auto_refresh(self):
         await self._refresh_cache()
 
+    # ==================== 日期解析 ====================
+
+    @staticmethod
+    def _parse_date_input(raw: str):
+        """
+        尝试多种格式解析日期输入 → (year, month, day) 或 (None, err_msg)
+        支持格式：2024-7-24, 2024/07/24, 2024.7.24, 20240724,
+                 7月24日, 7月24号, 2024年7月24日, 24/7/2024
+        """
+        raw = raw.strip()
+        if not raw:
+            return None, "输入为空"
+
+        patterns = [
+            # 2024-07-24, 2024/07/24, 2024.07.24
+            (r'^(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})$',
+             lambda m: (int(m[1]), int(m[2]), int(m[3]))),
+            # 2024年7月24日 / 号
+            (r'^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?$',
+             lambda m: (int(m[1]), int(m[2]), int(m[3]))),
+            # 7月24日 / 号 (补当前年份)
+            (r'^(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]$',
+             lambda m: (datetime.now().year, int(m[1]), int(m[2]))),
+            # 20240724
+            (r'^(\d{4})(\d{2})(\d{2})$',
+             lambda m: (int(m[1]), int(m[2]), int(m[3]))),
+            # 24/7/2024
+            (r'^(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{4})$',
+             lambda m: (int(m[3]), int(m[2]), int(m[1]))),
+        ]
+
+        for pattern, extract in patterns:
+            m = re.match(pattern, raw)
+            if m:
+                y, mo, d = extract(m)
+                if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+                    try:
+                        datetime(y, mo, d)
+                        return (y, mo, d), None
+                    except ValueError:
+                        return None, f"「{raw}」日期不存在（如2月30日）"
+                else:
+                    return None, f"「{raw}」日期数值超出范围"
+
+        # 检查是否像日期但无法解析
+        if re.search(r'[\d]{3,}|[年月日号]', raw):
+            return None, (
+                f"「{raw}」看起来像日期但格式不对。\n"
+                f"支持格式：2024-7-24 / 2024/07/24 / 20240724 / 7月24日 / 2024年7月24日"
+            )
+
+        return None, None  # 不像是日期，当作普通关键词
+
     # ==================== 指令 ====================
 
     @filter.command("抽动态")
@@ -76,12 +129,22 @@ class JiaranPostPlugin(Star):
 
     @filter.command("搜动态")
     async def cmd_search_post(self, event: AstrMessageEvent):
-        """按关键词搜索嘉然动态并让LLM评论"""
+        """按关键词或日期搜索嘉然动态并让LLM评论"""
         raw_text = event.message_str.strip()
-        # 提取关键词（去掉指令前缀 "/搜动态"）
-        keyword = re.sub(r'^[/\s]*搜动态\s*', '', raw_text).strip()
-        if not keyword:
-            yield event.plain_result("❌ 请输入搜索关键词，例如：/搜动态 晚安")
+        # 提取参数（去掉指令前缀 "/搜动态"）
+        param = re.sub(r'^[/\s]*搜动态\s*', '', raw_text).strip()
+        if not param:
+            yield event.plain_result(
+                "❌ 请输入关键词或日期，例如：\n"
+                "/搜动态 晚安\n"
+                "/搜动态 2024-07-24"
+            )
+            return
+
+        # 尝试日期解析
+        (date_tuple, date_err) = self._parse_date_input(param)
+        if date_err:
+            yield event.plain_result(date_err)
             return
 
         items = await self._get_all_posts()
@@ -91,23 +154,49 @@ class JiaranPostPlugin(Star):
             yield event.plain_result("❌ 没有可用的日常动态~")
             return
 
-        # 关键词匹配（大小写不敏感）
-        matched = []
-        for item in candidates:
-            post_text = self._extract_post_text_fast(item)
-            if keyword.lower() in post_text.lower():
-                matched.append(item)
+        if date_tuple:
+            # --- 日期搜索 ---
+            y, mo, d = date_tuple
+            tz_cn = timezone(timedelta(hours=8))
+            start_ts = int(datetime(y, mo, d, tzinfo=tz_cn).timestamp())
+            end_ts = int(datetime(y, mo, d, 23, 59, 59, tzinfo=tz_cn).timestamp())
 
-        if not matched:
-            yield event.plain_result(f"❌ 没有找到包含「{keyword}」的动态~")
-            return
+            matched = []
+            for item in candidates:
+                ts = self._get_post_timestamp(item)
+                if start_ts <= ts <= end_ts:
+                    matched.append(item)
 
-        item = random.choice(matched)
-        async for result in self._render_one_post(
-            event, item,
-            f"📢 搜到一条含「{keyword}」的然然动态！（共{len(matched)}条匹配）\n"
-        ):
-            yield result
+            if not matched:
+                date_str = f"{y}年{mo}月{d}日"
+                yield event.plain_result(f"❌ 没有找到 {date_str} 的动态~")
+                return
+
+            item = random.choice(matched)
+            date_str = f"{y}年{mo}月{d}日"
+            async for result in self._render_one_post(
+                event, item,
+                f"📢 抽到一条 {date_str} 的然然动态！（当天共{len(matched)}条）\n"
+            ):
+                yield result
+        else:
+            # --- 关键词搜索 ---
+            matched = []
+            for item in candidates:
+                post_text = self._extract_post_text_fast(item)
+                if param.lower() in post_text.lower():
+                    matched.append(item)
+
+            if not matched:
+                yield event.plain_result(f"❌ 没有找到包含「{param}」的动态~")
+                return
+
+            item = random.choice(matched)
+            async for result in self._render_one_post(
+                event, item,
+                f"📢 搜到一条含「{param}」的然然动态！（共{len(matched)}条匹配）\n"
+            ):
+                yield result
 
     async def _render_one_post(self, event: AstrMessageEvent, item: dict, header: str):
         """渲染并发送单条动态（正文+图片+LLM评论+链接+时间）"""
@@ -116,7 +205,12 @@ class JiaranPostPlugin(Star):
             yield event.plain_result("❌ 解析动态数据出错，请稍后重试~")
             return
 
-        link = f"https://t.bilibili.com/{post_id}"
+        # 根据动态类型生成正确链接
+        post_type = self._get_post_type(item)
+        if post_type == "MAJOR_TYPE_OPUS":
+            link = f"https://www.bilibili.com/opus/{post_id}"
+        else:
+            link = f"https://t.bilibili.com/{post_id}"
         bj_time = datetime.fromtimestamp(pub_ts, tz=timezone(timedelta(hours=8)))
         time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -165,6 +259,15 @@ class JiaranPostPlugin(Star):
             opus = major.get("opus") or {}
             text = JiaranPostPlugin._extract_text_from_summary(opus.get("summary") or {})
         return text
+
+    @staticmethod
+    def _get_post_timestamp(item: dict) -> int:
+        """快速获取动态时间戳（不做完整解析）"""
+        if not isinstance(item, dict):
+            return 0
+        modules = item.get("modules") or {}
+        author = modules.get("module_author") or {}
+        return int(author.get("pub_ts", 0))
 
     @filter.command("更新动态")
     async def cmd_update(self, event: AstrMessageEvent):
@@ -299,51 +402,31 @@ class JiaranPostPlugin(Star):
         return headers
 
     async def _fetch_all_posts(self) -> list:
-        """并行拉取 polymer + legacy，合并去重，覆盖更全（尤其老图文）"""
-        results = await asyncio.gather(
-            self._fetch_with_polymer(),
-            self._fetch_with_legacy(),
-            return_exceptions=True,
-        )
-        polymer_items = results[0] if not isinstance(results[0], BaseException) else []
-        legacy_items = results[1] if not isinstance(results[1], BaseException) else []
-
-        # 以 id_str 去重（polymer 优先，legacy 补充 polymer 中没有的）
-        seen_ids = {item.get("id_str", "") for item in polymer_items if item.get("id_str")}
-        merged = list(polymer_items)
-        for item in legacy_items:
-            pid = item.get("id_str", "")
-            if pid and pid not in seen_ids:
-                seen_ids.add(pid)
-                merged.append(item)
-
-        logger.info(
-            f"[抽然动态] polymer {len(polymer_items)} + legacy {len(legacy_items)}"
-            f" → 合并 {len(merged)} 条"
-        )
-        return merged
+        items = await self._fetch_with_polymer()
+        if not items:
+            logger.warning("[抽然动态] polymer 空，降级纯 legacy...")
+            items = await self._fetch_with_legacy()
+        else:
+            # polymer 成功，再用 legacy 补拉更老的动态
+            logger.info(f"[抽然动态] polymer 拉完 {len(items)} 条，legacy 补拉旧动态...")
+            legacy_items = await self._fetch_with_legacy()
+            if legacy_items:
+                existing_ids = {i.get("id_str") for i in items}
+                new_count = 0
+                for li in legacy_items:
+                    if li.get("id_str") not in existing_ids:
+                        items.append(li)
+                        existing_ids.add(li["id_str"])
+                        new_count += 1
+                logger.info(f"[抽然动态] legacy 补拉 +{new_count} 条（合并后 {len(items)} 条）")
+        return items
 
     async def _fetch_new_posts(self, existing_ids: set) -> list:
-        """并行增量拉取 polymer + legacy，合并去重"""
-        results = await asyncio.gather(
-            self._fetch_incremental_polymer(existing_ids),
-            self._fetch_incremental_legacy(existing_ids),
-            return_exceptions=True,
-        )
-        poly_new = results[0] if not isinstance(results[0], BaseException) else []
-        leg_new = results[1] if not isinstance(results[1], BaseException) else []
-
-        seen_ids = set(existing_ids)
-        merged = []
-        for item in (poly_new or []) + (leg_new or []):
-            pid = item.get("id_str", "")
-            if pid and pid not in seen_ids:
-                seen_ids.add(pid)
-                merged.append(item)
-
-        if poly_new is not None and leg_new is not None:
-            logger.info(f"[抽然动态] 增量: polymer +{len(poly_new or [])} legacy +{len(leg_new or [])} → {len(merged)}")
-        return merged
+        new_items = await self._fetch_incremental_polymer(existing_ids)
+        if new_items is None:
+            logger.warning("[抽然动态] polymer 增量失败，降级 legacy...")
+            new_items = await self._fetch_incremental_legacy(existing_ids)
+        return new_items or []
 
     async def _fetch_incremental_polymer(self, existing_ids: set) -> list | None:
         new_items = []
@@ -477,7 +560,9 @@ class JiaranPostPlugin(Star):
         all_items = []
         offset_dynamic_id = "0"
         page = 0
-        max_pages = int(self._config.get("max_fetch_pages", 0)) or 200
+        max_pages = int(self._config.get("max_fetch_pages", 0))
+        if max_pages <= 0:
+            max_pages = 500  # 0 表示不限制，设一个安全上限
         headers = self._build_headers()
 
         async with httpx.AsyncClient() as client:
