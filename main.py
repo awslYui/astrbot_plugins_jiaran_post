@@ -77,7 +77,7 @@ class JiaranPostPlugin(Star):
     @filter.command("搜动态")
     async def cmd_search_post(self, event: AstrMessageEvent):
         """按关键词搜索嘉然动态并让LLM评论"""
-        raw_text = event.get_plain_text().strip()
+        raw_text = event.message_str.strip()
         # 提取关键词（去掉指令前缀 "/搜动态"）
         keyword = re.sub(r'^[/\s]*搜动态\s*', '', raw_text).strip()
         if not keyword:
