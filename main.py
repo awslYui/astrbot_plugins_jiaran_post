@@ -615,9 +615,13 @@ class JiaranPostPlugin(Star):
                     logger.info(f"[抽然动态] polymer 第{page}页无数据，翻页终止")
                     break
                 if data.get("code") != 0:
-                    logger.error(f"[抽然动态] polymer: code={data.get('code')}, msg={data.get('message')}")
-                    if data.get("code") in (-101, -111):
+                    code = data.get("code")
+                    if code in (-352, -799):
+                        logger.warning(f"[抽然动态] polymer 被限流 (code={code})，已保存断点，下次继续")
+                    elif code in (-101, -111):
                         logger.error("[抽然动态] 需要登录！请在配置中填入 bilibili_cookie")
+                    else:
+                        logger.error(f"[抽然动态] polymer: code={code}, msg={data.get('message')}")
                     break
                 page_data = data.get("data", {})
                 items = page_data.get("items", [])
@@ -668,8 +672,9 @@ class JiaranPostPlugin(Star):
                 except httpx.TimeoutException:
                     logger.error(f"[抽然动态] legacy 第{page}页超时")
                     break
-                except Exception as e:
-                    logger.error(f"[抽然动态] legacy 第{page}页: {e}")
+                except Exception:
+                    sc = resp.status_code if 'resp' in dir() else "?"
+                    logger.info(f"[抽然动态] legacy 第{page}页无响应 (HTTP {sc})，翻页终止")
                     break
                 if data.get("code") != 0:
                     logger.error(f"[抽然动态] legacy: code={data.get('code')}, msg={data.get('message')}")
