@@ -6,6 +6,7 @@ import os
 import json
 import time
 import random
+import re
 import asyncio
 
 import httpx
@@ -16,7 +17,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("jiaran_post", "plugin_dev", "抽然动态", "1.4.0")
+@register("jiaran_post", "plugin_dev", "抽然动态", "1.5.0")
 class JiaranPostPlugin(Star):
     """嘉然B站动态随机抽取插件"""
 
@@ -70,6 +71,46 @@ class JiaranPostPlugin(Star):
             return
 
         item = random.choice(candidates)
+        async for result in self._render_one_post(event, item, "📢 抽到了一条然然的B站动态！\n"):
+            yield result
+
+    @filter.command("搜动态")
+    async def cmd_search_post(self, event: AstrMessageEvent):
+        """按关键词搜索嘉然动态并让LLM评论"""
+        raw_text = event.get_plain_text().strip()
+        # 提取关键词（去掉指令前缀 "/搜动态"）
+        keyword = re.sub(r'^[/\s]*搜动态\s*', '', raw_text).strip()
+        if not keyword:
+            yield event.plain_result("❌ 请输入搜索关键词，例如：/搜动态 晚安")
+            return
+
+        items = await self._get_all_posts()
+        items = [i for i in items if i is not None]
+        candidates = [i for i in items if self._get_post_type(i) not in self.SKIP_TYPES]
+        if not candidates:
+            yield event.plain_result("❌ 没有可用的日常动态~")
+            return
+
+        # 关键词匹配（大小写不敏感）
+        matched = []
+        for item in candidates:
+            post_text = self._extract_post_text_fast(item)
+            if keyword.lower() in post_text.lower():
+                matched.append(item)
+
+        if not matched:
+            yield event.plain_result(f"❌ 没有找到包含「{keyword}」的动态~")
+            return
+
+        item = random.choice(matched)
+        async for result in self._render_one_post(
+            event, item,
+            f"📢 搜到一条含「{keyword}」的然然动态！（共{len(matched)}条匹配）\n"
+        ):
+            yield result
+
+    async def _render_one_post(self, event: AstrMessageEvent, item: dict, header: str):
+        """渲染并发送单条动态（正文+图片+LLM评论+链接+时间）"""
         text, pub_ts, post_id, img_urls = self._parse_post(item)
         if not post_id:
             yield event.plain_result("❌ 解析动态数据出错，请稍后重试~")
@@ -79,17 +120,17 @@ class JiaranPostPlugin(Star):
         bj_time = datetime.fromtimestamp(pub_ts, tz=timezone(timedelta(hours=8)))
         time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 发送图片（先下载再发送，可作为独立消息）
+        # 发送图片
         if img_urls:
             downloaded = await self._download_images(img_urls)
             for img_path in downloaded:
                 yield event.image_result(img_path)
 
-        # 先获取 LLM 评论
-        llm_comment = await self._get_llm_comment(text)
+        # LLM 评论（传入发布时间）
+        llm_comment = await self._get_llm_comment(text, time_str)
 
         # 拼接正文
-        parts = ["📢 抽到了一条然然的B站动态！\n"]
+        parts = [header]
         if text.strip():
             parts.append(f"「{text.strip()}」")
         else:
@@ -104,6 +145,26 @@ class JiaranPostPlugin(Star):
         )
 
         yield event.plain_result("\n".join(parts))
+
+    @staticmethod
+    def _extract_post_text_fast(item: dict) -> str:
+        """快速提取动态文本（用于关键词匹配，不做完整解析）"""
+        if not isinstance(item, dict):
+            return ""
+        modules = item.get("modules") or {}
+        mod_post = modules.get("module_dynamic") or {}
+        # desc.text
+        desc = mod_post.get("desc") or {}
+        text = desc.get("text") or ""
+        # rich_text_nodes
+        if not text:
+            text = JiaranPostPlugin._extract_text_from_summary(desc)
+        # opus
+        major = mod_post.get("major") or {}
+        if major.get("type") == "MAJOR_TYPE_OPUS" and not text:
+            opus = major.get("opus") or {}
+            text = JiaranPostPlugin._extract_text_from_summary(opus.get("summary") or {})
+        return text
 
     @filter.command("更新动态")
     async def cmd_update(self, event: AstrMessageEvent):
@@ -672,15 +733,18 @@ class JiaranPostPlugin(Star):
 
     # ==================== LLM 评论 ====================
 
-    async def _get_llm_comment(self, post_text: str) -> str:
+    async def _get_llm_comment(self, post_text: str, time_str: str = "") -> str:
         """调用LLM以BOT人设评价动态"""
         if post_text.strip():
             content_desc = f"动态内容：\n{post_text.strip()}"
         else:
             content_desc = "这条动态是纯图片/视频动态，没有文字描述。"
 
+        time_line = f"该动态的发布时间是 {time_str}。" if time_str else ""
+
         prompt = (
-            f"下面是一条来自虚拟偶像「嘉然今天吃什么」在B站发布的最新动态。"
+            f"下面是一条来自虚拟偶像「嘉然今天吃什么」在B站发布的动态。"
+            f"{time_line}"
             f"请你以你的人物设定，从粉丝视角对这条动态发表一段简短的评论，"
             f"要求语气生动活泼、有真实粉丝的情感，不超过150字。"
             f"直接输出评论即可，不要加任何前缀。\n\n"
